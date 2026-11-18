@@ -33,17 +33,29 @@ from .prompts import (
     SYSTEM_PROMPT,
     digest_posts,
     event_build_prompt,
+    gap_plan_prompt,
     keyword_plan_prompt,
 )
-from .merge import merge_events
+from .controller import (
+    SAMPLE,
+    Gap,
+    candidate_pool,
+    detect_gaps,
+    hot_candidates,
+    plan_round,
+    stop_reason as gap_stop_reason,
+)
+from .merge import merge_events, similarity
 from .schemas import (
     Event,
     Evidence,
     Fact,
+    GapRecord,
     Investigation,
     Limitation,
     Metrics,
     SearchRecord,
+    dedupe_limitations,
 )
 from .trace import Tracer
 
@@ -54,6 +66,13 @@ _VALID_SOURCE_KINDS = {
     "hot_board",
     "unknown",
 }
+
+#: 喂给模型的帖子条数上限，必须与 prompts.digest_posts 的默认 limit 一致，
+#: 否则“第 N 条”的映射会和模型实际看到的内容错位。
+DIGEST_LIMIT = 60
+
+#: 真正算“证据”的 kind。other 是校验留痕（如“引用了不存在的 mid”），不能计入证据条数。
+REAL_EVIDENCE_KINDS = {"weibo_post", "official_site", "media_report"}
 
 
 def _norm_source_kind(value) -> str:
@@ -69,6 +88,13 @@ class Budget:
     max_minutes: float = 10.0
     per_keyword_posts: int = 30
     detail_checks_per_event: int = 2
+    # 总轮次上限（含第一轮）。轮次是比搜索次数更硬的刹车：
+    # 没有它，缺口一直判不出来时就会一直搜下去。
+    max_rounds: int = 3
+    # 单个事件低于这个证据条数就算"证据不足"
+    min_evidence: int = 3
+    # 整体样本低于这个条数就算"样本过薄"
+    min_posts: int = 10
 
     def __post_init__(self) -> None:
         self.started = time.time()
@@ -304,6 +330,9 @@ class Investigator:
         self.posts: dict[str, dict] = {}
         self.searches: list[SearchRecord] = []
         self.limitations: list[Limitation] = []
+        self.gap_log: list[GapRecord] = []
+        self.stop_reason: str = ""
+        self.rounds_used: int = 0
         self.hot_items: list[str] = []
         self.pages_read = 0
         self.empty_streak = 0
@@ -363,35 +392,243 @@ class Investigator:
         self.log("[2/5] 第一轮搜索……")
         round1 = self._plan_round1()
         self._search_many(round1, round_no=1)
+        self.rounds_used = 1
 
-        self.log("[3/5] 关键词扩展（自主扩展轮）……")
-        round2 = self._plan_expansion()
-        if round2:
-            self._search_many(round2, round_no=2)
-        else:
-            self.limitations.append(
-                Limitation(step="关键词扩展", detail="未从已读帖子中提取到可用的扩展关键词")
-            )
+        self.log(f"[3/5] 归纳事件（共读到 {len(self.posts)} 条去重帖子）……")
+        events = self._dedupe_events(self._build_events())
+        self.tracer.log("events_built", count=len(events), names=[e.name for e in events], round=1)
 
-        self.log(f"[4/5] 归纳事件（共读到 {len(self.posts)} 条去重帖子）……")
-        events = self._build_events()
-        self.tracer.log("events_built", count=len(events), names=[e.name for e in events])
-        events = self._dedupe_events(events)
+        self.log("[4/5] 缺口判定与补搜……")
+        events = self._run_gap_rounds(events)
 
         self.log("[5/5] 证据回填与详情页复核……")
         events = [self._attach_evidence(ev) for ev in events]
-        events = [ev for ev in events if ev.evidence]
+        # 只剩“防编造校验”提示的事件不算有证据，留着会让报告看起来查到了东西
+        events = [ev for ev in events if any(e.kind in REAL_EVIDENCE_KINDS for e in ev.evidence)]
 
         inv = Investigation(
             topic=f"{self.topic} 微博舆情",
             mode="llm" if self._llm_active() else "heuristic",
             events=events,
             searches=self.searches,
-            limitations=self.limitations,
+            limitations=dedupe_limitations(self.limitations),
+            gaps=self.gap_log,
+            stop_reason=self.stop_reason,
         )
         inv.metrics = self._metrics(inv)
         self.tracer.log("run_end", **inv.metrics.model_dump())
         return inv
+
+    # ------------------------------------------------------------------ #
+    # 缺口驱动的补搜循环
+    # ------------------------------------------------------------------ #
+    def _run_gap_rounds(self, events: list[Event]) -> list[Event]:
+        """反复「算缺口 → 挑词 → 搜 → 重新归纳」，直到没得补或预算用尽。
+
+        每一轮都必须满足两个条件才继续：有可执行的缺口，且上一轮真的带来了新帖子。
+        第二个条件是对微博这类数据源的现实妥协——同一个话题第二轮往往返回同一批帖子，
+        再搜只是重复消耗配额和触发风控。
+        """
+        pending: list[tuple[str, str, GapRecord]] = []
+        round_no = 2
+        while round_no <= self.budget.max_rounds:
+            gaps = detect_gaps(
+                events,
+                self.posts,
+                [s.keyword for s in self.searches],
+                self.hot_items,
+                self.topic,
+                min_evidence=self.budget.min_evidence,
+                min_posts=self.budget.min_posts,
+            )
+            self._resolve_pending(pending, gaps, events)
+            self.tracer.log(
+                "gaps",
+                round=round_no,
+                count=len(gaps),
+                gaps=[g.as_dict() for g in gaps],
+            )
+            if gaps:
+                self.log(
+                    f"      第 {round_no - 1} 轮后缺口 {len(gaps)} 个："
+                    + "；".join(g.line() for g in gaps[:3])
+                    + ("…" if len(gaps) > 3 else "")
+                )
+
+            if self.budget.exhausted(len(self.searches), self.pages_read):
+                # 说清楚是哪一项用尽，否则"预算耗尽"会让人误以为是时间不够
+                hits: list[str] = []
+                if len(self.searches) >= self.budget.max_searches:
+                    hits.append(f"搜索次数达上限 {self.budget.max_searches} 组")
+                if self.pages_read >= self.budget.max_pages:
+                    hits.append(f"页面数达上限 {self.budget.max_pages}")
+                if self.budget.minutes_left() <= 0:
+                    hits.append(f"时间用尽（上限 {self.budget.max_minutes:g} 分钟）")
+                self.stop_reason = "预算耗尽：" + "；".join(hits or ["未知"])
+                self.tracer.log("round_stop", round=round_no, reason=self.stop_reason)
+                break
+
+            plan = self._plan_from_gaps(gaps, round_no)
+            if not plan.keywords:
+                self.stop_reason = gap_stop_reason(gaps, plan)
+                self.tracer.log("round_stop", round=round_no, reason=self.stop_reason)
+                self.log(f"      停止：{self.stop_reason}")
+                break
+
+            self.log(
+                f"      第 {round_no} 轮补搜：" + "、".join(plan.keywords)
+                + f"（依据：{plan.reason_for(plan.keywords[0]).split('：')[0]}）"
+            )
+            self.tracer.log(
+                "round_plan",
+                round=round_no,
+                keywords=plan.keywords,
+                reasons={g.line(): kws for g, kws in plan.assignments},
+            )
+
+            before = len(self.posts)
+            # 每个判出来的缺口都记一笔，包括这一轮没轮到搜的：
+            # 只记"搜了的"会让报告看起来缺口全被处理过，实际有的从头到尾没管。
+            for gap in gaps:
+                assigned = [k for k in plan.keywords if k in gap.candidates]
+                rec = GapRecord(
+                    round=round_no,
+                    kind=gap.kind,
+                    target=gap.target,
+                    detail=gap.detail,
+                    action="、".join(assigned),
+                )
+                self.gap_log.append(rec)
+                pending.append((gap.kind, gap.target, rec))
+
+            self._search_many(plan.keywords, round_no=round_no)
+            self.rounds_used = round_no
+
+            if len(self.posts) == before:
+                self.stop_reason = (
+                    f"第 {round_no} 轮补搜未带来新帖子，继续搜索只会重复同一批内容"
+                )
+                self.tracer.log("round_stop", round=round_no, reason=self.stop_reason)
+                self.log(f"      停止：{self.stop_reason}")
+                break
+
+            events = self._dedupe_events(self._build_events())
+            self.tracer.log(
+                "events_built",
+                count=len(events),
+                names=[e.name for e in events],
+                round=round_no,
+            )
+            round_no += 1
+        else:
+            if not self.stop_reason:
+                self.stop_reason = f"达到轮次上限 {self.budget.max_rounds} 轮"
+
+        # 循环结束后还挂着的缺口，说明补了但没补上，也要留痕
+        self._resolve_pending(pending, detect_gaps(
+            events,
+            self.posts,
+            [s.keyword for s in self.searches],
+            self.hot_items,
+            self.topic,
+            min_evidence=self.budget.min_evidence,
+            min_posts=self.budget.min_posts,
+        ), events)
+        if not self.stop_reason:
+            self.stop_reason = "各事件证据已达标，无缺口需要补搜"
+        return events
+
+    def _resolve_pending(
+        self,
+        pending: list[tuple[str, str, GapRecord]],
+        gaps,
+        events: list[Event],
+    ) -> None:
+        """回看上一轮的缺口在这轮是否消失。
+
+        事件名每轮都可能被模型改写（实测同一事件三轮三个名字），所以不能按名字精确匹配，
+        否则所有缺口都会变成"无法判定"。这里按相似度找最接近的事件：
+        对上了就看该事件是否还有同类缺口；对不上才记 None。
+        """
+        current = {(g.kind, g.target) for g in gaps}
+        by_name: dict[str, set[str]] = {}
+        for g in gaps:
+            by_name.setdefault(g.target, set()).add(g.kind)
+        names = [e.name for e in events]
+
+        for kind, target, rec in pending:
+            if target == SAMPLE:
+                rec.resolved = (kind, SAMPLE) not in current
+                continue
+            best, score = "", 0.0
+            for name in names:
+                s = similarity(target, name)
+                if s > score:
+                    best, score = name, s
+            # 阈值取 0.55：低于此值说明事件被视为换了一件，判定无意义
+            rec.resolved = kind not in by_name.get(best, set()) if score >= 0.55 else None
+        pending.clear()
+
+    def _plan_from_gaps(self, gaps, round_no: int):
+        """先由代码按优先级排好，再让模型在候选里挑；模型挑不中就用代码的结果。"""
+        searched = [s.keyword for s in self.searches]
+        searched_set = set(searched)
+        pool = candidate_pool(self.posts, searched_set)
+        hot = hot_candidates(self.hot_items, self.topic, searched_set)
+        # 只有"还没扩展过任何关键词"时才允许保底搜索；缺口清零后再搜就是白烧配额
+        first_expansion = round_no == 2 and len(self.searches) < 2
+        plan = plan_round(gaps, pool, hot, searched, allow_fallback=first_expansion)
+
+        if not self._llm_active() or not plan.keywords:
+            return plan
+
+        # 模型只能在候选里挑，候选之外的一律丢弃
+        allowed: dict[str, str] = {}
+        for gap in gaps:
+            for kw in gap.candidates:
+                allowed.setdefault(kw, gap.line())
+        for kw in plan.keywords:
+            allowed.setdefault(kw, "代码按优先级选出的候选")
+
+        payload = self.llm.chat_json(
+            SYSTEM_PROMPT,
+            gap_plan_prompt(
+                self.topic,
+                [g.line() for g in gaps],
+                list(allowed)[:12],
+                searched,
+                round_no,
+            ),
+            purpose=f"gap_plan_r{round_no}",
+        )
+        planned = [
+            str(k).strip().strip("#") for k in (payload or {}).get("keywords") or []
+        ]
+        valid = [k for k in planned if k in allowed and k not in searched_set]
+        if not valid:
+            if payload:
+                self.tracer.log(
+                    "gap_plan_rejected",
+                    round=round_no,
+                    planned=planned,
+                    reason="模型给出的词不在候选内，已丢弃并改用代码排序",
+                )
+            return plan
+
+        # 把模型选中的词还回它对应的缺口，保证补搜记录能对上
+        plan.keywords = valid[:3]
+        plan.assignments = []
+        for gap in gaps:
+            picked = [k for k in plan.keywords if k in gap.candidates]
+            if picked:
+                plan.assignments.append((gap, picked))
+        assigned = {k for _, kws in plan.assignments for k in kws}
+        rest = [k for k in plan.keywords if k not in assigned]
+        if rest:
+            plan.assignments.append(
+                (Gap("FALLBACK", SAMPLE, "模型补充的候选词", 9, rest), rest)
+            )
+        return plan
 
     # ------------------------------------------------------------------ #
     # 关键词规划
@@ -419,42 +656,6 @@ class Investigator:
             if kw not in keywords:
                 keywords.append(kw)
         return keywords[:5]
-
-    def _plan_expansion(self) -> list[str]:
-        """从已读帖子的话题词里挑扩展关键词（保证至少扩展一次）。"""
-        counter: Counter[str] = Counter()
-        for post in self.posts.values():
-            for tag in post.get("hashtags") or []:
-                counter[tag] += 1
-
-        searched = {s.keyword for s in self.searches}
-        candidates = [
-            tag for tag, count in counter.most_common(20) if count >= 2 and tag not in searched
-        ]
-
-        if self._llm_active() and candidates:
-            payload = self.llm.chat_json(
-                SYSTEM_PROMPT,
-                keyword_plan_prompt(
-                    self.topic, [f"#{c}#" for c in candidates] + self.hot_items,
-                    list(searched), 2,
-                ),
-                purpose="keyword_plan_r2",
-            )
-            planned = [str(k).strip().strip("#") for k in (payload or {}).get("keywords") or []]
-            planned = [k for k in planned if k and k not in searched]
-            if planned:
-                return planned[:3]
-
-        if candidates:
-            return candidates[:2]
-        # 退路：榜单里与主题相关但还没搜过的条目
-        fallback = [
-            h.strip("#")
-            for h in self.hot_items
-            if _topic_match(h, self.topic) and h.strip("#") not in searched
-        ]
-        return fallback[:2]
 
     # ------------------------------------------------------------------ #
     # 搜索与读取
@@ -530,12 +731,18 @@ class Investigator:
             return []
 
         if self._llm_active():
+            shown = posts[:DIGEST_LIMIT]
             payload = self.llm.chat_json(
                 SYSTEM_PROMPT,
                 event_build_prompt(self.topic, digest_posts(posts), len(posts), self.hot_items),
                 purpose="event_build",
             )
-            events = self._events_from_llm(payload)
+            # 序号映射必须用**给模型看的那一批**帖子，不能是全部：
+            # 输入被截断时，第 70 条并不在模型眼前，按序号映射会张冠李戴。
+            index_map = {
+                i: str(p.get("mid")) for i, p in enumerate(shown, 1) if p.get("mid")
+            }
+            events = self._events_from_llm(payload, index_map)
             if events:
                 return events
             # 区分"模型没返回"和"返回了但结构不对"，两者修法完全不同
@@ -567,7 +774,37 @@ class Investigator:
             )
         return merged
 
-    def _coerce_llm_facts(self, raw, fallback_mids: list[str]) -> list[Fact]:
+    def _resolve_mids(self, values, index_map: dict[int, str]) -> tuple[list[str], int]:
+        """把模型给的引用解析成 mid。
+
+        实测里模型会把摘要的“第 N 条”当成 mid 填回来——它看到的每条记录都有序号，
+        而 mid 是一串长数字，模型倾向于挑更短的那个。这是引用格式问题，不是编造，
+        所以按序号做**确定性映射**：第 N 条就是输入里的第 N 条，可逐条核对。
+        映射了几条要记进 limitations，不能悄悄发生。
+        """
+        out: list[str] = []
+        mapped = 0
+        for value in values or []:
+            text = str(value).strip().strip("[]")
+            if not text:
+                continue
+            if text in self.posts:
+                mid = text
+            elif text.isdigit() and int(text) in index_map:
+                mid = index_map[int(text)]
+                mapped += 1
+            else:
+                mid = text  # 保留原值，交给白名单过滤时丢弃并留痕
+            if mid not in out:
+                out.append(mid)
+        return out, mapped
+
+    def _coerce_llm_facts(
+        self,
+        raw,
+        fallback_mids: list[str],
+        index_map: dict[int, str] | None = None,
+    ) -> list[Fact]:
         """模型可能给字符串数组，也可能给带 supporting_mids 的对象数组，两种都收。
 
         三种情况必须区分开：
@@ -592,9 +829,9 @@ class Investigator:
             if not text:
                 continue
 
-            claimed = [
-                str(m) for m in (item.get("supporting_mids") or item.get("mids") or [])
-            ]
+            claimed, _ = self._resolve_mids(
+                item.get("supporting_mids") or item.get("mids") or [], index_map or {}
+            )
             valid = [m for m in claimed if m in self.posts]
             if claimed and not valid:
                 supporting: list[str] = []
@@ -612,23 +849,28 @@ class Investigator:
             )
         return out
 
-    def _events_from_llm(self, payload: dict | None) -> list[Event]:
+    def _events_from_llm(
+        self, payload: dict | None, index_map: dict[int, str] | None = None
+    ) -> list[Event]:
         if not payload:
             return []
         raw_events = payload.get("events")
         if not isinstance(raw_events, list):
             return []
+        index_map = index_map or {}
         out: list[Event] = []
+        mapped_total = 0
         for item in raw_events[: self.max_events]:
             if not isinstance(item, dict) or not item.get("name"):
                 continue
-            mids = [str(m) for m in item.get("evidence_mids") or []]
+            mids, mapped = self._resolve_mids(item.get("evidence_mids") or [], index_map)
+            mapped_total += mapped
             ev = Event(
                 name=str(item.get("name")).strip(),
                 summary=str(item.get("summary") or ""),
                 heat=_norm_heat(item.get("heat")),
                 heat_basis=str(item.get("heat_basis") or ""),
-                facts=self._coerce_llm_facts(item.get("facts"), mids),
+                facts=self._coerce_llm_facts(item.get("facts"), mids, index_map),
                 opinions=[str(x) for x in item.get("opinions") or []],
                 speculations=[str(x) for x in item.get("speculations") or []],
                 judgement=str(item.get("judgement") or ""),
@@ -638,6 +880,14 @@ class Investigator:
                 ev.judgement = (ev.judgement + "\n争议：" + str(item["controversy"])).strip()
             ev.evidence = self._evidence_from_mids(mids)
             out.append(ev)
+
+        if mapped_total:
+            detail = (
+                f"模型用摘要里的「第 N 条」序号引用证据 {mapped_total} 处，"
+                "已按输入顺序映射为对应 mid（可逐条核对，非补全）"
+            )
+            self.limitations.append(Limitation(step="证据引用", detail=detail))
+            self.tracer.log("mids_mapped", count=mapped_total, detail=detail)
         return out
 
     def _events_heuristic(self) -> list[Event]:
@@ -756,7 +1006,8 @@ class Investigator:
             out.append(
                 Evidence(
                     kind="other",
-                    content="模型引用了未在抓取结果中出现的 mid，已丢弃：" + ", ".join(missing[:5]),
+                    content="（校验留痕，非证据）模型引用了未在抓取结果中出现的 mid，已丢弃："
+                    + ", ".join(missing[:5]),
                     note="防编造校验",
                 )
             )
@@ -819,8 +1070,16 @@ class Investigator:
             posts_with_verified_link=sum(1 for p in posts if p.get("url")),
             posts_detail_verified=sum(1 for p in posts if p.get("detail_verified")),
             events_formed=len(inv.events),
-            evidence_items=sum(len(e.evidence) for e in inv.events),
+            evidence_items=sum(
+                1
+                for e in inv.events
+                for item in e.evidence
+                if item.kind in REAL_EVIDENCE_KINDS
+            ),
             speculations=sum(len(e.speculations) for e in inv.events),
+            rounds_used=self.rounds_used,
+            gaps_detected=len(self.gap_log),
+            gaps_resolved=sum(1 for g in self.gap_log if g.resolved),
             **self.llm.stats(),
         )
 

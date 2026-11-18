@@ -310,5 +310,96 @@ class LLMTraceTest(unittest.TestCase):
         self.assertIn("模型调用：成功 3 次｜失败尝试 1 次｜累计 2.5 秒", md)
 
 
+class MidReferenceTest(unittest.TestCase):
+    """模型用摘要行号引用证据时的处理。
+
+    实测（2026-11-18，qwen 系列）：给模型的每条记录都带"第 N 条"序号，
+    模型就把序号当 mid 填回来，导致全部引用被判无效、三个事件的证据清空。
+    这是引用格式问题而非编造，所以按序号做确定性映射，并留痕。
+    """
+
+    def _inv(self, n: int = 5) -> Investigator:
+        inv = Investigator(session=None, tracer=Tracer(None), log=lambda *_: None)
+        for i in range(1, n + 1):
+            inv.posts[f"900{i}"] = {
+                "mid": f"900{i}",
+                "author": f"作者{i}",
+                "hashtags": ["#APEC#"],
+                "text": f"正文{i}",
+                "url": f"https://m.weibo.cn/detail/900{i}",
+            }
+        return inv
+
+    def _index_map(self, inv: Investigator) -> dict[int, str]:
+        return {i: p["mid"] for i, p in enumerate(inv.posts.values(), 1)}
+
+    def test_row_number_is_mapped_to_mid(self) -> None:
+        inv = self._inv()
+        payload = {"events": [{"name": "事件A", "evidence_mids": ["2", "4"]}]}
+        events = inv._events_from_llm(payload, self._index_map(inv))
+        mids = [e.mid for e in events[0].evidence]
+        self.assertEqual(mids, ["9002", "9004"])
+        self.assertTrue(any("第 N 条" in x.detail for x in inv.limitations))
+
+    def test_real_mid_is_kept_without_mapping_note(self) -> None:
+        inv = self._inv()
+        payload = {"events": [{"name": "事件A", "evidence_mids": ["9003"]}]}
+        events = inv._events_from_llm(payload, self._index_map(inv))
+        self.assertEqual([e.mid for e in events[0].evidence], ["9003"])
+        self.assertFalse(inv.limitations)
+
+    def test_unknown_reference_is_still_dropped(self) -> None:
+        """映射只对输入范围内成立；越界或乱填的照旧丢弃，不能借映射放行编造。"""
+        inv = self._inv()
+        payload = {"events": [{"name": "事件A", "evidence_mids": ["99", "888888"]}]}
+        events = inv._events_from_llm(payload, self._index_map(inv))
+        kinds = [e.kind for e in events[0].evidence]
+        self.assertEqual(kinds, ["other"])
+        self.assertIn("已丢弃", events[0].evidence[0].content)
+
+    def test_supporting_mids_are_mapped_too(self) -> None:
+        inv = self._inv()
+        payload = {
+            "events": [
+                {
+                    "name": "事件A",
+                    "evidence_mids": ["1"],
+                    "facts": [{"text": "某事实", "supporting_mids": ["1", "3"]}],
+                }
+            ]
+        }
+        events = inv._events_from_llm(payload, self._index_map(inv))
+        fact = events[0].facts[0]
+        self.assertEqual(fact.supporting_mids, ["9001", "9003"])
+        self.assertFalse(fact.inferred_link)
+
+    def test_index_beyond_digest_limit_is_not_mapped(self) -> None:
+        """输入被截断时，模型没看到第 70 条，按序号映射会张冠李戴。"""
+        from agent.investigator import DIGEST_LIMIT
+
+        inv = self._inv(DIGEST_LIMIT + 5)
+        shown = list(inv.posts.values())[:DIGEST_LIMIT]
+        index_map = {i: p["mid"] for i, p in enumerate(shown, 1)}
+        payload = {"events": [{"name": "事件A", "evidence_mids": ["70"]}]}
+        events = inv._events_from_llm(payload, index_map)
+        self.assertEqual([e.kind for e in events[0].evidence], ["other"])
+
+
+class EvidenceCountingTest(unittest.TestCase):
+    """“防编造校验”是留痕，不是证据，不能计入证据条数。"""
+
+    def test_placeholder_is_not_counted(self) -> None:
+        from agent.investigator import REAL_EVIDENCE_KINDS
+
+        inv = Investigator(session=None, tracer=Tracer(None), log=lambda *_: None)
+        inv.posts = {"1": {"mid": "1", "author": "甲", "text": "x", "url": "u"}}
+        ev = Event(name="事件A", evidence=inv._evidence_from_mids(["1", "999"]))
+        self.assertEqual([e.kind for e in ev.evidence], ["weibo_post", "other"])
+        counted = sum(1 for e in ev.evidence if e.kind in REAL_EVIDENCE_KINDS)
+        self.assertEqual(counted, 1)
+        m = inv._metrics(Investigation(topic="t", events=[ev]))
+        self.assertEqual(m.evidence_items, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

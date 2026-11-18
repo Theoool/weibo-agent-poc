@@ -37,6 +37,34 @@ def keyword_plan_prompt(topic: str, hot_items: list[str], searched: list[str], r
 """
 
 
+def gap_plan_prompt(
+    topic: str, gap_lines: list[str], candidates: list[str], searched: list[str], round_no: int
+) -> str:
+    gap_block = "\n".join(f"- {x}" for x in gap_lines) or "（无显式缺口）"
+    cand_block = "\n".join(f"- {x}" for x in candidates) or "（无可选候选词）"
+    used_block = "、".join(searched) or "（无）"
+    return f"""调查主题：{topic}
+当前是第 {round_no} 轮补搜。已搜索过的关键词：{used_block}
+
+上一轮结束后，代码检测到的证据缺口如下：
+{gap_block}
+
+下面这些候选关键词，全部来自已抓到的帖子正文话题词或公开热搜榜单条目：
+{cand_block}
+
+任务：从上面的候选里挑 2 到 3 个本轮要搜的关键词，用于补齐缺口。
+
+规则：
+- **只能从候选列表里选，不得输出候选之外的词**，不得把两个词拼成一个新词，
+  不得添加"官方""回应""详情"之类的修饰语。
+- 优先覆盖优先级最高的缺口。
+- 同一事件的多个候选只取一个，避免同义词重复搜。
+- 如果候选都无法补上缺口，就输出空数组——不要为了凑数随便选。
+
+只输出 JSON：{{"keywords": ["关键词1"], "reason": "一句话说明这组词补的是哪个缺口"}}
+"""
+
+
 def digest_posts(posts: list[dict], limit: int = 60, text_limit: int = 160) -> str:
     """把帖子压成给模型看的摘要块，保留 mid/url 以便回填证据。"""
     rows: list[str] = []
@@ -45,7 +73,7 @@ def digest_posts(posts: list[dict], limit: int = 60, text_limit: int = 160) -> s
         if len(text) > text_limit:
             text = text[:text_limit] + "…"
         rows.append(
-            f"[{i}] mid={p.get('mid') or '?'} | 作者={p.get('author') or '?'} | "
+            f"mid={p.get('mid') or '?'}（第 {i} 条）| 作者={p.get('author') or '?'} | "
             f"时间={p.get('time') or '?'} | 赞{p.get('likes')}/评{p.get('comments')}/转{p.get('reposts')}\n"
             f"    正文：{text}\n"
             f"    url：{p.get('url') or '无可验证直链'}"
@@ -64,13 +92,13 @@ EVENT_SCHEMA_HINT = """{
       "facts": [
         {
           "text": "可直接由原始来源确认的事实，一句话",
-          "supporting_mids": ["支撑这句话的 mid，只能填输入中出现过的；挂不上就留空数组"],
+          "supporting_mids": ["支撑这句话的 mid 长数字串，不是摘要里的“第 N 条”；挂不上就留空数组"],
           "source_kind": "weibo_post | official_site | media_report | unknown"
         }
       ],
       "opinions": ["账号/媒体/受访者表达的观点，注明是谁的观点"],
       "speculations": ["证据不足、只能作为推测的内容"],
-      "evidence_mids": ["只能填输入中出现过的 mid"],
+      "evidence_mids": ["只能填 mid 字段的完整长数字串"],
       "judgement": "用一段话说明事实/观点/推测的边界，以及是否存在来源矛盾",
       "controversy": "若存在互相矛盾的来源，写在这里；否则留空字符串"
     }
@@ -97,6 +125,7 @@ def event_build_prompt(topic: str, digest: str, total: int, hot_items: list[str]
 - 属于同一事件的不同话题必须合并为一个事件，不要拆分。
 - heat 只能依据"该事件的帖子在已抓取样本中的占比"来判断，并在 heat_basis 里写出具体数字。
 - evidence_mids 只填输入中出现过的 mid，每条事件至少 3 个（能填满就填满，不够就如实少填）。
+  注意：**mid 是那串长数字**，不是摘要里“第 N 条”的序号。填序号会被判为无效引用。
 - 每条 facts 都要用 supporting_mids 说明"是哪几条帖子支撑了这句话"，只能引用输入里出现过的 mid。
   一句话由多条帖子共同支撑就都填上；确实挂不上就把数组留空，**不要随手填几个 mid 凑数**。
 - facts / opinions / speculations 三栏必须分开；无法确认的一律放 speculations。

@@ -250,6 +250,7 @@ def stage1(args: argparse.Namespace, session) -> int:
 def stage2(args: argparse.Namespace, session) -> int:
     from datetime import datetime
 
+    from agent.controller import KIND_LABEL as GAP_LABEL
     from agent.investigator import Budget, Investigator, LLMClient, write_outputs
     from agent.trace import Tracer
 
@@ -278,6 +279,8 @@ def stage2(args: argparse.Namespace, session) -> int:
             max_minutes=args.max_minutes,
             per_keyword_posts=args.max_posts,
             detail_checks_per_event=args.detail_checks,
+            max_rounds=args.rounds,
+            min_evidence=args.min_evidence,
         ),
         llm=client,
         logged_in=logged_in,
@@ -285,6 +288,20 @@ def stage2(args: argparse.Namespace, session) -> int:
     )
     inv = investigator.run()
     json_path, md_path = write_outputs(inv, OUTPUT_DIR)
+
+    print()
+    print("决策链（缺口驱动）")
+    print(_line())
+    m = inv.metrics
+    print(
+        f"  轮次 {m.rounds_used}｜判出缺口 {m.gaps_detected} 个｜补上 {m.gaps_resolved} 个"
+        f"｜停止原因：{inv.stop_reason or '（未记录）'}"
+    )
+    for rec in inv.gaps:
+        mark = "✓" if rec.resolved else ("✗" if rec.resolved is False else "?")
+        label = GAP_LABEL.get(rec.kind, rec.kind)
+        print(f"  {mark} 第 {rec.round} 轮 [{label}] {_clip(rec.target, 24)}：{_clip(rec.detail, 34)}")
+        print(f"      补搜：{rec.action or '（未搜）'}")
 
     print()
     print(inv.to_markdown())
@@ -301,6 +318,8 @@ def stage2(args: argparse.Namespace, session) -> int:
         print(f"         明细：uv run python main.py --trace {trace_path}")
 
     m = inv.metrics
+    from agent.investigator import REAL_EVIDENCE_KINDS
+
     print()
     print("POC 验收清单")
     print(_line())
@@ -310,9 +329,14 @@ def stage2(args: argparse.Namespace, session) -> int:
         ("形成事件 ≥3 个", m.events_formed >= 3, f"实际 {m.events_formed} 个"),
         (
             "每事件证据 ≥2 条",
-            bool(inv.events) and all(len(e.evidence) >= 2 for e in inv.events),
+            bool(inv.events)
+            and all(
+                sum(1 for x in e.evidence if x.kind in REAL_EVIDENCE_KINDS) >= 2
+                for e in inv.events
+            ),
             f"共 {m.evidence_items} 条",
         ),
+        ("停止原因已记录", bool(inv.stop_reason), inv.stop_reason or "未记录"),
     ]
     all_pass = True
     for name, cond, detail in checks:
@@ -537,6 +561,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-pages", type=int, default=30, help="Agent 阶段最多页面数")
     p.add_argument("--max-minutes", type=float, default=10.0, help="Agent 阶段时间上限（分钟）")
     p.add_argument("--detail-checks", type=int, default=2, help="每个事件详情页复核条目数")
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="搜索总轮次上限（1 轮种子 + 缺口驱动补搜），含第一轮",
+    )
+    p.add_argument(
+        "--min-evidence",
+        type=int,
+        default=3,
+        help="单个事件低于该证据条数即判为「证据不足」缺口",
+    )
     p.add_argument(
         "--trace",
         default=None,

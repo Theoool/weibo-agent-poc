@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+from .controller import KIND_LABEL as GAP_LABEL
 
 Heat = Literal["high", "medium", "low", "unknown"]
 EvidenceKind = Literal["weibo_post", "hot_board", "official_site", "media_report", "other"]
@@ -63,6 +66,44 @@ class Limitation(BaseModel):
     detail: str
 
 
+def dedupe_limitations(items: list["Limitation"]) -> list["Limitation"]:
+    """同一限制只留一条。
+
+    “详情页预算耗尽”这类限制是每个事件各记一次的，四个事件就打印四遍同一句话，
+    把真正不同的限制淹掉。保留首次出现顺序，附上重复次数以便看出影响范围。
+    """
+    counts: Counter[tuple[str, str]] = Counter((x.step, x.detail) for x in items)
+    seen: set[tuple[str, str]] = set()
+    out: list[Limitation] = []
+    for item in items:
+        key = (item.step, item.detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        detail = item.detail
+        if counts[key] > 1:
+            detail = f"{detail}（同类共 {counts[key]} 次）"
+        out.append(Limitation(step=item.step, detail=detail))
+    return out
+
+
+class GapRecord(BaseModel):
+    """一次缺口判定与它的补搜动作。
+
+    记下来是因为报告里最该解释的问题不是"查到了什么"，而是
+    "为什么不再查了"——没有这条，读者无法判断这份报告是查够了还是被预算截断。
+    """
+
+    round: int = 0
+    kind: str = ""
+    target: str = ""
+    detail: str = ""
+    # 这一轮实际为它搜了哪些词
+    action: str = ""
+    # True=下一轮该缺口消失；False=仍在；None=事件名变了，无法判定
+    resolved: bool | None = None
+
+
 class Event(BaseModel):
     name: str
     summary: str = ""
@@ -109,6 +150,10 @@ class Metrics(BaseModel):
     llm_calls: int = 0
     llm_failures: int = 0
     llm_ms: int = 0
+    # 缺口驱动循环：实际跑了几轮、判出多少缺口、补上了多少
+    rounds_used: int = 0
+    gaps_detected: int = 0
+    gaps_resolved: int = 0
 
 
 class Investigation(BaseModel):
@@ -118,6 +163,9 @@ class Investigation(BaseModel):
     events: list[Event] = Field(default_factory=list)
     searches: list[SearchRecord] = Field(default_factory=list)
     limitations: list[Limitation] = Field(default_factory=list)
+    gaps: list[GapRecord] = Field(default_factory=list)
+    # 为什么停在这里。空字符串表示旧产物（那时候没有循环，也没有停止原因）
+    stop_reason: str = ""
     metrics: Metrics = Field(default_factory=Metrics)
 
     def to_markdown(self) -> str:
@@ -136,11 +184,34 @@ class Investigation(BaseModel):
                 f"- 模型调用：成功 {m.llm_calls} 次｜失败尝试 {m.llm_failures} 次"
                 f"｜累计 {m.llm_ms / 1000:.1f} 秒"
             )
+        if m.rounds_used:
+            lines.append(
+                f"- 调查轮次：{m.rounds_used} 轮（含首轮）｜判出缺口 {m.gaps_detected} 个"
+                f"｜补上 {m.gaps_resolved} 个"
+            )
+        if self.stop_reason:
+            lines.append(f"- 停止原因：{self.stop_reason}")
         lines += [""]
 
         if self.limitations:
             lines += ["## 访问限制记录", ""]
-            lines += [f"- **{x.step}**：{x.detail}" for x in self.limitations]
+            # 旧产物里可能有重复项，渲染时也收敛一次
+            lines += [f"- **{x.step}**：{x.detail}" for x in dedupe_limitations(self.limitations)]
+            lines.append("")
+
+        if self.gaps:
+            lines += ["## 补搜记录（缺口驱动）", ""]
+            for g in self.gaps:
+                if g.resolved is True:
+                    outcome = "已补齐"
+                elif g.resolved is False:
+                    outcome = "仍缺"
+                else:
+                    outcome = "无法判定（事件名变化）"
+                lines.append(
+                    f"- 第 {g.round} 轮｜{GAP_LABEL.get(g.kind, g.kind)}｜{g.target}：{g.detail}"
+                    f"｜补搜：{g.action or '（未搜）'}｜{outcome}"
+                )
             lines.append("")
 
         if any(f.inferred_link for ev in self.events for f in ev.facts):
