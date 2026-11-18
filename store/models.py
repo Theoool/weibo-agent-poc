@@ -372,6 +372,54 @@ class TraceEvent(Base):
 
 
 # --------------------------------------------------------------------------- #
+# 队列
+# --------------------------------------------------------------------------- #
+class QueueJob(Base):
+    """一次待执行的阶段尝试。
+
+    与 `StageRun` 的分工：这里是"排队/租约/重试"的状态机，`StageRun` 只记录
+    **真正开始执行**的尝试。见 `migrations/0005_queue.sql` 顶部说明。
+    """
+
+    __tablename__ = "queue_job"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        String, ForeignKey("workflow_run.id", ondelete="CASCADE"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(String, nullable=False)
+    # queued | running | succeeded | failed | cancelled
+    status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    stage_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    worker_id: Mapped[str] = mapped_column(String, nullable=False, default="")
+    lease_until: Mapped[str | None] = mapped_column(String, nullable=True)
+    available_at: Mapped[str] = mapped_column(String, nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    finished_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class WorkerHeartbeat(Base):
+    """worker 存活凭据。API 用它回答"为什么一直是 queued"。"""
+
+    __tablename__ = "worker_heartbeat"
+
+    worker_id: Mapped[str] = mapped_column(String, primary_key=True)
+    host: Mapped[str] = mapped_column(String, nullable=False, default="")
+    pid: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[str] = mapped_column(String, nullable=False)
+    last_seen_at: Mapped[str] = mapped_column(String, nullable=False)
+    jobs_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+# --------------------------------------------------------------------------- #
 # 度量
 # --------------------------------------------------------------------------- #
 class RunMetric(Base):

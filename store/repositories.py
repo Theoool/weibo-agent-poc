@@ -19,12 +19,13 @@ import json
 import re
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from agent.schemas import (
@@ -53,12 +54,14 @@ from .models import (
     GapRecord,
     LLMCall,
     Limitation,
+    QueueJob,
     RunMetric,
     SearchRecord,
     SourceCheck,
     SourceDocument,
     StageRun,
     TraceEvent,
+    WorkerHeartbeat,
     WorkflowRun,
 )
 from .db import PROJECT_ROOT
@@ -74,6 +77,11 @@ QUALITY_LABELS = {"full": "完整（含全文快照）", "degraded": "降级（�
 # --------------------------------------------------------------------------- #
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def iso_after(seconds: float) -> str:
+    """相对现在偏移若干秒的 ISO 时间。负数表示过去（查存活窗口时用）。"""
+    return (datetime.now() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def new_id(prefix: str) -> str:
@@ -194,7 +202,8 @@ class RunStore:
                     app_version=app_version(),
                     parent_run_id=parent_run_id,
                     started_at=now,
-                    finished_at=now if status != "running" else None,
+                    # queued 也是"还没结束"：写完时间会让 API 显示成已完成
+                    finished_at=None if status in ("running", "queued") else now,
                 )
             )
             s.commit()
@@ -1137,10 +1146,15 @@ class RunStore:
                 "error": run.error,
                 "partial": bool(run.partial),
                 "parent_run_id": run.parent_run_id,
+                # 重跑要按原参数重放；不给的话只能靠猜当年的预算
+                "config": _loads(run.config_json, {}),
                 "stages": stages,
-                "counts": counts,
-                "metrics": metrics,
+                "counts": counts,                "metrics": metrics,
             }
+
+    def run_queue(self, run_id: str) -> dict | None:
+        """run 的队列信息。轮询侧靠它区分"在排队""在跑""失败了"。"""
+        return self.job_of_run(run_id)
 
     def list_runs(self, limit: int = 20, topic: str | None = None, offset: int = 0) -> list[dict]:
         with self.Session() as s:
@@ -1465,6 +1479,405 @@ class RunStore:
             self.engine.dispose()
         except Exception:  # noqa: BLE001
             pass
+
+    # ---------------------------------------------------------------- 队列
+    # 队列只服务一个目的：把"要跑一次调查"从 HTTP 请求里分离出来。
+    # 所有写操作都很短（单行 UPDATE），因为 API 和 worker 是两个进程，
+    # SQLite 下靠"短事务 + busy_timeout"避免长时间持锁。
+    def enqueue(
+        self,
+        run_id: str,
+        stage: str,
+        *,
+        payload: dict | None = None,
+        priority: int = 0,
+        max_attempts: int = 3,
+        delay_sec: int = 0,
+    ) -> dict:
+        """入队一个阶段。已有同 run+stage 的活跃任务时直接返回它。
+
+        幂等是必须的：客户端重试 POST /retry、worker 在"提交成功但响应丢失"
+        之后重发，都不该让同一次调查跑两遍。
+        """
+        with self.Session() as s:
+            active = (
+                s.execute(
+                    select(QueueJob).where(
+                        QueueJob.run_id == run_id,
+                        QueueJob.stage == stage,
+                        QueueJob.status.in_(("queued", "running")),
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if active is not None:
+                return self._job_dict(s, active)
+
+            now = now_iso()
+            job = QueueJob(
+                id=new_id("job"),
+                run_id=run_id,
+                stage=stage,
+                status="queued",
+                priority=priority,
+                attempts=0,
+                max_attempts=max(1, max_attempts),
+                payload_json=json.dumps(payload or {}, ensure_ascii=False),
+                available_at=iso_after(delay_sec),
+                created_at=now,
+            )
+            s.add(job)
+            # run 的对外状态跟着走：否则客户端刚创建完看到的是 running，其实还没人领
+            run = s.get(WorkflowRun, run_id)
+            if run is not None:
+                run.status = "queued"
+                run.finished_at = None
+                run.error = ""
+            try:
+                s.commit()
+            except IntegrityError:
+                # 两个客户端同时重试同一个阶段：唯一索引替我们挡住了第二次插入。
+                # 这不是错误，返回已经在队里的那个任务即可（幂等的最后一道保险）。
+                s.rollback()
+                active = (
+                    s.execute(
+                        select(QueueJob).where(
+                            QueueJob.run_id == run_id,
+                            QueueJob.stage == stage,
+                            QueueJob.status.in_(("queued", "running")),
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if active is None:
+                    raise
+                return self._job_dict(s, active)
+            return self._job_dict(s, job)
+
+    def claim_job(
+        self,
+        worker_id: str,
+        *,
+        lease_sec: int = 900,
+        stages: list[str] | None = None,
+    ) -> dict | None:
+        """原子领取一个任务。
+
+        写法是"先 SELECT 再带条件 UPDATE，看 rowcount"：
+        SQLite 在 WAL 下允许并发读，两个 worker 可能读到同一行；但 UPDATE 会串行，
+        第二个的 `WHERE status='queued'` 已经不再成立 → rowcount=0 → 重试下一行。
+        这样不依赖 SQLite 版本（RETURNING 要 3.35+），也不需要在应用层加锁。
+        """
+        for _ in range(5):
+            now = now_iso()
+            with self.Session() as s:
+                q = select(QueueJob).where(
+                    QueueJob.status == "queued", QueueJob.available_at <= now
+                )
+                if stages:
+                    q = q.where(QueueJob.stage.in_(stages))
+                job = (
+                    s.execute(
+                        q.order_by(
+                            QueueJob.priority.desc(),
+                            QueueJob.created_at,
+                            text("queue_job.rowid"),
+                        ).limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                if job is None:
+                    return None
+
+                res = s.execute(
+                    update(QueueJob)
+                    .where(
+                        QueueJob.id == job.id,
+                        QueueJob.status == "queued",
+                        QueueJob.available_at <= now,
+                    )
+                    .values(
+                        status="running",
+                        worker_id=worker_id,
+                        attempts=QueueJob.attempts + 1,
+                        started_at=now,
+                        lease_until=iso_after(lease_sec),
+                        error="",
+                    )
+                )
+                if res.rowcount != 1:
+                    s.rollback()
+                    continue
+
+                run = s.get(WorkflowRun, job.run_id)
+                if run is not None:
+                    run.status = "running"
+                s.commit()
+                s.refresh(job)
+                return self._job_dict(s, job)
+        return None
+
+    def bind_job_stage(self, job_id: str, stage_run_id: str) -> None:
+        """把队列条目与真正的阶段尝试接上。
+
+        回填之后，租约过期时才能把那次尝试标成失败；否则会留下一条永远
+        `running` 的 stage_run，报告里的阶段耗时从此没有终点。
+        """
+        with self.Session() as s:
+            s.execute(
+                update(QueueJob).where(QueueJob.id == job_id).values(stage_run_id=stage_run_id)
+            )
+            s.commit()
+
+    def heartbeat(
+        self,
+        worker_id: str,
+        *,
+        host: str = "",
+        pid: int = 0,
+        jobs_done: int = 0,
+        last_error: str = "",
+    ) -> None:
+        now = now_iso()
+        with self.Session() as s:
+            row = s.get(WorkerHeartbeat, worker_id)
+            if row is None:
+                s.add(
+                    WorkerHeartbeat(
+                        worker_id=worker_id,
+                        host=host,
+                        pid=pid,
+                        started_at=now,
+                        last_seen_at=now,
+                        jobs_done=jobs_done,
+                        last_error=last_error[:500],
+                    )
+                )
+            else:
+                row.last_seen_at = now
+                row.jobs_done = jobs_done
+                # 错误要能被"下一次成功"清掉，否则永远挂着上一次的旧错
+                row.last_error = last_error[:500]
+            s.commit()
+
+    def renew_lease(self, job_id: str, lease_sec: int = 900) -> None:
+        with self.Session() as s:
+            s.execute(
+                update(QueueJob)
+                .where(QueueJob.id == job_id, QueueJob.status == "running")
+                .values(lease_until=iso_after(lease_sec))
+            )
+            s.commit()
+
+    def finish_job(self, job_id: str, status: str = "succeeded", error: str = "") -> None:
+        with self.Session() as s:
+            s.execute(
+                update(QueueJob)
+                .where(QueueJob.id == job_id)
+                .values(status=status, error=error or "", finished_at=now_iso(), lease_until=None)
+            )
+            s.commit()
+
+    def reclaim_expired(self, *, now: str | None = None) -> dict:
+        """回收失联 worker 手上的任务。
+
+        两种结局：
+        - 还有重试次数 → 放回 queued。**attempts 不重置**，否则一个必然崩溃的任务
+          会被无限重跑，把整台机器的时间吃光；
+        - 次数用尽 → failed，并把那次 stage 尝试一起标失败。
+        """
+        now = now or now_iso()
+        requeued: list[str] = []
+        failed: list[str] = []
+        with self.Session() as s:
+            expired = list(
+                s.execute(
+                    select(QueueJob).where(
+                        QueueJob.status == "running",
+                        QueueJob.lease_until.is_not(None),
+                        QueueJob.lease_until < now,
+                    )
+                ).scalars()
+            )
+            for job in expired:
+                if job.stage_run_id:
+                    stage = s.get(StageRun, job.stage_run_id)
+                    if stage is not None and stage.status == "running":
+                        stage.status = "failed"
+                        stage.error = "worker 在租约期内没有完成（进程被杀或卡死）"
+                        stage.finished_at = now
+                if job.attempts >= job.max_attempts:
+                    job.status = "failed"
+                    job.error = f"连续 {job.attempts} 次未能完成，已停止重试"
+                    job.finished_at = now
+                    job.lease_until = None
+                    run = s.get(WorkflowRun, job.run_id)
+                    if run is not None and run.status in ("queued", "running"):
+                        run.status = "failed"
+                        run.finished_at = now
+                        run.error = job.error
+                    failed.append(job.id)
+                else:
+                    job.status = "queued"
+                    job.worker_id = ""
+                    job.lease_until = None
+                    # 立刻可用：这类失败通常是进程被杀，等一下并不能让它变好
+                    job.available_at = now
+                    requeued.append(job.id)
+            s.commit()
+        return {"requeued": requeued, "failed": failed}
+
+    def request_cancel(self, run_id: str) -> dict:
+        """请求取消。排队中的直接作废；运行中的只打标记。
+
+        不直接改运行中任务的状态，是因为那个进程还在写文件与库。让它自己
+        在轮次边界收尾，才不会留下"status=cancelled 但文件写了一半"的状态。
+        """
+        with self.Session() as s:
+            job = (
+                s.execute(
+                    select(QueueJob)
+                    .where(
+                        QueueJob.run_id == run_id,
+                        QueueJob.status.in_(("queued", "running")),
+                    )
+                    .order_by(QueueJob.created_at.desc())
+                )
+                .scalars()
+                .first()
+            )
+            if job is None:
+                return {"cancelled": False, "state": "已经结束，没有可取消的任务"}
+
+            run = s.get(WorkflowRun, run_id)
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.finished_at = now_iso()
+                job.error = "创建后未执行即被取消"
+                if run is not None:
+                    run.status = "cancelled"
+                    run.finished_at = now_iso()
+                s.commit()
+                return {"cancelled": True, "state": "已取消（尚未开始执行）"}
+
+            job.cancel_requested = True
+            s.commit()
+            return {
+                "cancelled": True,
+                "state": "已请求取消，将在当前轮次结束时生效",
+                "job_id": job.id,
+            }
+
+    def cancel_requested(self, job_id: str) -> bool:
+        with self.Session() as s:
+            row = s.get(QueueJob, job_id)
+            return bool(row and row.cancel_requested)
+
+    def job_of_run(self, run_id: str) -> dict | None:
+        with self.Session() as s:
+            job = (
+                s.execute(
+                    select(QueueJob)
+                    .where(QueueJob.run_id == run_id)
+                    # created_at 只到秒，重跑与失败常常同一秒内发生，必须用 rowid 兜底，
+                    # 否则"最近一个任务"会随机取到旧的失败任务
+                    .order_by(QueueJob.created_at.desc(), text("queue_job.rowid DESC"))
+                )
+                .scalars()
+                .first()
+            )
+            return self._job_dict(s, job) if job is not None else None
+
+    def queue_overview(self, *, stale_after_sec: int = 90) -> dict:
+        with self.Session() as s:
+            counts = {
+                status: int(
+                    s.execute(
+                        select(func.count()).select_from(QueueJob).where(QueueJob.status == status)
+                    ).scalar()
+                    or 0
+                )
+                for status in ("queued", "running", "succeeded", "failed", "cancelled")
+            }
+            oldest = s.execute(
+                select(QueueJob.created_at)
+                .where(QueueJob.status == "queued")
+                .order_by(QueueJob.created_at)
+                .limit(1)
+            ).scalar()
+            alive_since = iso_after(-stale_after_sec)
+            workers = [
+                {
+                    "worker_id": w.worker_id,
+                    "host": w.host,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "last_seen_at": w.last_seen_at,
+                    "jobs_done": w.jobs_done,
+                    "last_error": w.last_error,
+                }
+                for w in s.execute(
+                    select(WorkerHeartbeat)
+                    .where(WorkerHeartbeat.last_seen_at >= alive_since)
+                    .order_by(WorkerHeartbeat.last_seen_at.desc())
+                ).scalars()
+            ]
+            recent = [
+                self._job_dict(s, j)
+                for j in s.execute(
+                    select(QueueJob)
+                    .order_by(QueueJob.created_at.desc(), text("queue_job.rowid DESC"))
+                    .limit(10)
+                ).scalars()
+            ]
+        return {
+            "counts": counts,
+            # 队列里最老的等待时长：配合 worker_alive 一眼看出是"忙"还是"没人消费"
+            "oldest_queued_at": oldest,
+            "worker_alive": bool(workers),
+            "workers": workers,
+            "recent": recent,
+        }
+
+    def _job_dict(self, s: Session, job: QueueJob) -> dict:
+        ahead = 0
+        if job.status == "queued":
+            # 排序键是 (created_at, rowid)：同一秒里建的多个任务，只看时间戳
+            # 会全部算成"前面 0 个"，客户端看到的排队位次就是错的
+            ahead = int(
+                s.execute(
+                    text(
+                        "SELECT COUNT(*) FROM queue_job WHERE status='queued' AND "
+                        "(created_at < :created OR (created_at = :created AND rowid < "
+                        "(SELECT rowid FROM queue_job WHERE id = :jid)))"
+                    ),
+                    {"created": job.created_at, "jid": job.id},
+                ).scalar()
+                or 0
+            )
+        return {
+            "id": job.id,
+            "run_id": job.run_id,
+            "stage": job.stage,
+            "status": job.status,
+            "priority": job.priority,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "stage_run_id": job.stage_run_id,
+            "worker_id": job.worker_id,
+            "lease_until": job.lease_until,
+            "available_at": job.available_at,
+            "cancel_requested": bool(job.cancel_requested),
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "error": job.error,
+            "ahead": ahead,
+            "payload": _loads(job.payload_json, {}),
+        }
 
     @property
     def engine(self):

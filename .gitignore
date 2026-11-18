@@ -11,6 +11,8 @@ output/*.json
 output/*.md
 output/*.jsonl
 !output/.gitkeep
+# 队列模式下每条运行独占一个目录
+output/runs/
 
 # 本地密钥
 .env

@@ -19,6 +19,8 @@ from ..deps import get_store
 
 router = APIRouter(prefix="/api", tags=["health"])
 
+WORKER_HINT = "uv run python -m worker"
+
 #: 采集用的专用 Chrome profile（`browser/chrome.py` 的默认值，这里不 import 它，
 #: 免得为了一个健康检查把 playwright 拉进 API 进程）
 CHROME_PROFILE = PROJECT_ROOT / ".chrome-profile"
@@ -63,6 +65,22 @@ def ready(store: RunStore = Depends(get_store)) -> dict:
         "ok": CHROME_PROFILE.exists(),
         "detail": str(CHROME_PROFILE)
         + ("" if CHROME_PROFILE.exists() else "｜不存在，采集阶段需先登录一次"),
+    }
+
+    # worker 不在线不算 not ready：查询历史数据完全不受影响，
+    # 但新任务会一直排队，所以必须单独报出来
+    queue = store.queue_overview()
+    checks["worker"] = {
+        "ok": queue["worker_alive"] or queue["counts"]["queued"] == 0,
+        "detail": (
+            f"{len(queue['workers'])} 个在线｜排队 {queue['counts']['queued']}"
+            f"｜运行 {queue['counts']['running']}"
+            + (
+                ""
+                if queue["worker_alive"] or queue["counts"]["queued"] == 0
+                else f"｜有任务在排队但没有 worker：{WORKER_HINT}"
+            )
+        ),
     }
 
     # 模型 Key 与 Chrome 属于"采集能力"，缺了不影响查历史，所以不算 not ready

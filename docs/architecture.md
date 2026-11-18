@@ -1,13 +1,13 @@
 # 整体架构设计：工作流留存 + 数据分级 + FastAPI
 
-> 状态：设计已确认，M1~M3 已实施（持久层 + 轨迹入库 + 只读 API）。
+> 状态：设计已确认，M1~M4 已实施（持久层 + 轨迹入库 + 查询 API + 队列与 worker）。
 > 范围：把当前「文件产物 + JSONL 轨迹」的 POC，改造成「以 run 为聚合根、证据可审计、API 可查询」的服务。
 >
 > 实施进度：
 > - [x] **M1** SQLAlchemy 模型、迁移（v1~v3）、`RunStore`、blobs、历史产物导入、CLI 双写
 > - [x] **M2** `TraceSink` 协议 + `DbSink` + `llm_call` / `trace_event` 落库（迁移 v4）
 > - [x] **M3** FastAPI 只读层（`api/`，同步查询 + 现渲染报告）
-> - [ ] **M4** `POST /runs` + worker 队列
+> - [x] **M4** `POST /runs` + worker 队列（迁移 v5：`queue_job` / `worker_heartbeat`）
 > - [ ] **M5** 分级落地（备份、清理、索引）
 > - [ ] **M6** 文档收尾 + 回归
 >
@@ -26,6 +26,14 @@
 >   原文` 会永远断链（17 条来源 0 条命中）。`_document_id_for_url()` 现在先试 mid。
 > - **阶段顺序不能只按 `started_at`。** 四个阶段常在同一秒内建完，时间戳相等后
 >   SQLite 的返回顺序不确定，报告与 API 里的阶段顺序会跳。加 `rowid` 兜底。
+>
+> M4 修正一处（§4.4）：设计稿写的是「轮询 `stage_run where status='queued'`」，
+> 但排队不是一个阶段尝试。没被领走的任务若也写 `stage_run`，阶段列表里会多出一次
+> 从未发生的尝试；租约每秒在变，混进 `stage_run` 会污染"这个阶段跑了多久"；
+> 取消需要作用于"还没开始"的任务，那种状态在 `stage_run` 里没有位置。
+> 迁移 v5 因此单独建 `queue_job`（含 `attempts` / `lease_until` / `cancel_requested`），
+> `stage_run` 仍只记录**真正执行过**的尝试。同一批迁移顺带加了 `worker_heartbeat`：
+> 没有它，"任务一直 queued"和"worker 挂了"在 API 里长得一模一样。
 
 ---
 
@@ -232,11 +240,13 @@ GET  /api/runs/{id}  →  轮询阶段状态
 
 | 方法 | 路径 | 状态 | 说明 |
 |---|---|---|---|
-| POST | `/api/runs` | M4 | 创建并排队一次工作流 |
+| POST | `/api/runs` | ✅ | 创建并排队一次工作流（202 + 轮询） |
 | GET | `/api/runs` | ✅ | 列表（topic / 分页过滤） |
-| GET | `/api/runs/{id}` | ✅ | 概览：阶段状态 + 指标 + 停止原因 + `provenance` |
+| GET | `/api/runs/{id}` | ✅ | 概览：阶段状态 + 指标 + 停止原因 + `provenance` + `queue` |
 | GET | `/api/runs/{id}/stages` | ✅ | 四段状态与耗时 |
-| POST | `/api/runs/{id}/retry` | M4 | 从失败阶段重跑（attempt+1） |
+| POST | `/api/runs/{id}/retry` | ✅ | 从失败阶段重跑（新 job，旧 attempt 保留） |
+| POST | `/api/runs/{id}/cancel` | ✅ | 排队中立即作废；运行中在轮次边界停 |
+| GET | `/api/queue` | ✅ | 积压、在线 worker、最近任务（"为什么一直是 queued"） |
 | GET | `/api/runs/{id}/report?format=md\|json` | ✅ | 产物，**从 B 级现渲染**（`X-Report-Source` 说明来源） |
 | GET | `/api/runs/{id}/trace` | ✅ | trace 事件（按 seq 有序，可分页 / 按 step 过滤） |
 | GET | `/api/runs/{id}/llm-calls` | ✅ | 模型调用列表；默认不含全文，`include_text=true` 才返回 |
@@ -278,10 +288,17 @@ queued ──→ running ──→ succeeded
 - 若放在 uvicorn 进程内：`--reload` 会杀掉任务；进程重启丢失在跑的任务；异步事件循环被同步 Chrome 阻塞
 - SQLite 多进程写会 `database is locked`
 
-方案：独立 `python -m worker` 进程轮询 `stage_run where status='queued'`。
+方案：独立 `python -m worker` 进程从 `queue_job` 领任务（不是轮询 `stage_run`，
+原因见文档开头 M4 修正）。
 
-- SQLite 下靠「单写者」保证不冲突：worker 是唯一写重数据的进程，API 只做轻量写（建 run、改状态）
+- SQLite 下靠「单写者」保证不冲突：worker 是唯一写重数据的进程，API 只做轻量写（建 run、入队、改状态）
 - WAL + `busy_timeout=5000`
+- 领取是「带条件 UPDATE + 看 rowcount」：两个 worker 读到同一行是允许的，
+  第二个 UPDATE 会因为 `status='queued'` 不成立而落空，然后重试下一行
+- 租约 30 分钟 + 后台线程续租：worker 被杀之后，任务在租约过期时被回收重排；
+  **业务异常不自动重试**（配置错了重跑一百次也一样），只有"进程没了"才重试
+- 每个阶段一个 job，成功后排队下一阶段：这样 `POST /retry` 能只重跑失败的那一步，
+  而不是把已经成功的调查再跑一遍
 - 将来并发上来 → 换 Postgres，仓储层代码不动
 
 代价两条进程一起起。用 `uv run python -m api` + `uv run python -m worker` 两个命令，或一个 `scripts/dev.sh`。
@@ -297,6 +314,21 @@ queued ──→ running ──→ succeeded
 
 `provenance` 对历史导入的 run 会返回 `note`："无法确定核对的是哪一次调查"。
 这比编一个上游 run_id 诚实——当年确实没记。
+
+### 4.6 M4 落地时的四个决定
+
+| 决定 | 做法 | 理由 |
+|---|---|---|
+| 队列单独一张表 | `queue_job`，不往 `stage_run` 加 `status='queued'` | 见开头 M4 修正：排队不是一次阶段尝试，租约和取消也没有地方放 |
+| worker 单并发 | 一次只领一个任务，不设线程池 | 专用 Chrome profile 同一时刻只能被一个进程占用；多开会互相抢锁，失败得莫名其妙 |
+| 业务异常不自动重试 | 处理器抛异常 → job `failed`，等人工 `retry`；只有租约过期（进程没了）才重排 | 配置错了重跑一百次也是错；而进程被杀是环境问题，重试有意义 |
+| 抽取 `workflow/` | 阶段执行器从 `main.py` 移出，命令行与 worker 共用 | 两份实现迟早会分岔，而"API 跑出来的报告和命令行不一样"是最难查的那类 bug |
+| 每个 run 独占输出目录 | `output/runs/<run_id>/` | 命令行时代所有人都写 `output/investigation.json`，队列里同时排着多条调查就会互相覆盖 |
+
+`cancel` 的语义值得单独说：**排队中的立即作废，运行中的只打标记**。正在跑的进程
+还在写文件与库，由 API 单方面改状态会留下"cancelled 但文件写了一半"的记录。
+worker 在每轮补搜的边界检查一次标记——不做到"中断正在翻的页"是有意的：
+那会把浏览器的半截状态留给下一次运行，比多跑 30 秒代价更大。
 
 ---
 
@@ -329,22 +361,29 @@ queued ──→ running ──→ succeeded
 
 ```
 weibo-agent-poc/
-├─ main.py                 # CLI（保持不变，加 --db / --import-output）
-├─ worker.py               # 队列消费者（新，M4）
-├─ api/                    # FastAPI 只读层（M3，已实现）
+├─ main.py                 # CLI（四阶段编排改为调 workflow/，行为不变）
+├─ worker.py               # 队列消费者（M4）：领任务、建阶段、跑、推进下一阶段
+├─ workflow/               # 阶段执行器（命令行与 worker 共用）
+│  ├─ context.py           # RunContext：run_id / stage_id / 输出目录 / 取消钩子
+│  ├─ investigate.py       # 调查 → 文件产物 + 入库
+│  ├─ handoff.py           # 调查产物 → 核查清单（队列里从库里读）
+│  ├─ factcheck.py         # 核查（输入优先取 claims_json artifact）
+│  └─ sinks.py             # JSONL + 数据库双写
+├─ api/                    # HTTP 层（M3 查询 + M4 创建/重跑/取消）
 │  ├─ app.py               # app 工厂 + lifespan（建库、关库）
+│  ├─ schemas.py           # 写接口请求体与预算上限
 │  ├─ deps.py              # get_store / require_run（只暴露 RunStore，不暴露 session）
 │  ├─ __main__.py          # `python -m api --port 8000`
-│  └─ routers/{runs,documents,reports,trace,health}.py
+│  └─ routers/{runs,queue,documents,reports,trace,health}.py
 ├─ store/                  # 持久层（新）
 │  ├─ models.py            # SQLAlchemy 2.0 模型
-│  ├─ repositories.py      # RunStore / DocumentStore
+│  ├─ repositories.py      # RunStore：编排 / 证据 / 语义 / 队列
 │  ├─ blobs.py             # 内容寻址读写
 │  ├─ db_sink.py           # DbSink：轨迹与模型调用全文落库
-│  ├─ mappers.py           # Pydantic ↔ ORM
-│  └─ migrations/          # 顺序 SQL + schema_version
-├─ agent/ browser/ factcheck/ tests/   # 基本不动
+│  └─ migrations/          # 顺序 SQL + schema_version（v1~v5）
+├─ agent/ browser/ factcheck/ tests/   # 领域层基本不动
 ├─ artifacts/              # CAS 目录（gitignore）
+├─ output/runs/<run_id>/   # 每次运行独占的输出目录（gitignore）
 └─ data/workflow.db        # SQLite（gitignore）
 ```
 
@@ -362,7 +401,7 @@ weibo-agent-poc/
 | **M3** | FastAPI 只读层 | 用历史数据回答：「哪次调查产出了这份核查」「某帖子被抓过几次、内容变没变」 |
 | **M4** | `POST /runs` + worker 队列 | 一条 curl 起一次调查，轮询到完成 |
 | **M5** | 分级落地：A 级备份脚本、C 级清理、索引 | 备份/恢复演练通过；清理 C 级后历史报告数字不变 |
-| **M6** | 文档收尾 + 回归 | 99 个单测 + API 集成测试全绿 |
+| **M6** | 文档收尾 + 回归 | 全部单测 + API 集成测试全绿（当前 177 例） |
 
 M3 是关键的**验收点**：如果只读层用真实历史数据无法回答「这份核查报告的依据是哪几条帖子原文」，说明 A 级字段设计不够，要回头改，而不是等 M5。
 

@@ -30,8 +30,9 @@
 8) 把改造前的历史产物导入数据库（标记 degraded）
    uv run python main.py --import-output output
 
-只读 API（独立进程，查 run / 证据 / 轨迹 / 报告）：
-   uv run python -m api --port 8000
+HTTP 与队列（两个独立进程）：
+   uv run python -m api --port 8000   # 查询 + 创建/重跑/取消（POST /api/runs）
+   uv run python -m worker            # 消费队列：采集必须在这里跑，API 进程不碰浏览器
 
 默认会写数据库（data/workflow.db）；加 --no-db 可只产出文件。
 """
@@ -288,10 +289,9 @@ def stage1(args: argparse.Namespace, session) -> int:
 # 第二阶段：Agent 自主调查
 # --------------------------------------------------------------------------- #
 def stage2(args: argparse.Namespace, session) -> int:
-    from datetime import datetime
-
     from agent.controller import KIND_LABEL as GAP_LABEL
-    from agent.investigator import Budget, Investigator, LLMClient, write_outputs
+    from agent.investigator import Budget, LLMClient, REAL_EVIDENCE_KINDS
+    from workflow import RunContext, execute_investigate
 
     print()
     print("[0/5] 检查登录态")
@@ -305,8 +305,6 @@ def stage2(args: argparse.Namespace, session) -> int:
         )
     else:
         print("[模式] heuristic（未配置 OPENAI_API_KEY，使用频率聚类降级）")
-
-    trace_path = OUTPUT_DIR / f"trace_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
 
     # 先把 run 建出来：它的 id 要写进产物，下游 handoff / factcheck 才能挂到同一条链上
     store = open_persistence(args)
@@ -334,56 +332,59 @@ def stage2(args: argparse.Namespace, session) -> int:
         stage_id = store.begin_stage(run_id, "investigate")
         print(f"[DB] run {run_id}｜investigate 已开始")
 
-    # 轨迹双写：JSONL 给人看（可提交、可 diff），数据库留 SQL 可查的那一份
-    tracer, db_sink = build_tracer(trace_path, store, run_id, stage_id)
-
-    investigator = Investigator(
-        session=session,
-        topic=args.keyword[0],
-        seed_keywords=args.keyword[1:],
-        budget=Budget(
-            max_searches=args.max_searches,
-            max_pages=args.max_pages,
-            max_minutes=args.max_minutes,
-            per_keyword_posts=args.max_posts,
-            detail_checks_per_event=args.detail_checks,
-            max_rounds=args.rounds,
-            min_evidence=args.min_evidence,
-        ),
-        llm=client,
-        logged_in=logged_in,
-        tracer=tracer,
+    # 采集、判断、落库全在 workflow/investigate.py 里：worker 走的是同一份代码，
+    # 否则"命令行跑出来的"和"API 跑出来的"迟早会分岔
+    ctx = RunContext(
+        store=store, run_id=run_id, stage_id=stage_id, out_dir=OUTPUT_DIR, log=print
     )
-    inv = investigator.run()
-    if run_id:
-        inv.run_id = run_id
-    json_path, md_path = write_outputs(inv, OUTPUT_DIR)
+    try:
+        outcome = execute_investigate(
+            ctx,
+            session,
+            topic=args.keyword[0],
+            seed_keywords=args.keyword[1:],
+            budget=Budget(
+                max_searches=args.max_searches,
+                max_pages=args.max_pages,
+                max_minutes=args.max_minutes,
+                per_keyword_posts=args.max_posts,
+                detail_checks_per_event=args.detail_checks,
+                max_rounds=args.rounds,
+                min_evidence=args.min_evidence,
+            ),
+            llm=client,
+            logged_in=logged_in,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if store is not None and run_id:
+            store.end_stage(stage_id, "failed", str(exc))
+            store.finish_run(run_id, "failed", error=str(exc))
+        print(f"[调查失败] {type(exc).__name__}: {exc}")
+        return 1
 
-    report_tracer_errors(tracer)
+    inv = outcome.investigation
+    json_path, md_path, trace_path = outcome.json_path, outcome.md_path, outcome.trace_path
+    print_tracer_errors(outcome.tracer_errors)
 
     if store is not None and run_id:
-        # posts 必须一起传：Investigation 里的证据正文是截断摘录，
-        # 只靠它入库会把最该留住的全文快照永久丢掉
         try:
-            stats = store.save_investigation(
-                inv, run_id, stage_id, posts=investigator.posts
-            )
-            store.save_artifact(run_id, stage_id, "report_md", inv.to_markdown())
             store.end_stage(stage_id, "succeeded")
             store.finish_run(run_id, "succeeded", stop_reason=inv.stop_reason)
+            stats = outcome.store_stats
             print(
-                f"[DB] 已留存：文档 {stats['documents']}｜事件 {stats['events']}"
-                f"｜事实 {stats['facts']}｜缺口 {stats['gaps']}｜搜索 {stats['searches']}"
+                f"[DB] 已留存：文档 {stats.get('documents', 0)}｜事件 {stats.get('events', 0)}"
+                f"｜事实 {stats.get('facts', 0)}｜缺口 {stats.get('gaps', 0)}"
+                f"｜搜索 {stats.get('searches', 0)}"
             )
-            if db_sink is not None:
+            if outcome.trace_events:
                 print(
-                    f"[DB] 轨迹 {db_sink.seq} 条｜模型调用 {db_sink.calls} 次"
+                    f"[DB] 轨迹 {outcome.trace_events} 条｜模型调用 {outcome.llm_calls} 次"
                     f"（题面与输出全文已留存，可逐字复现）"
                 )
         except Exception as exc:  # noqa: BLE001
             store.end_stage(stage_id, "failed", str(exc))
             store.finish_run(run_id, "failed", error=str(exc))
-            print(f"[DB] 写入失败：{exc}")
+            print(f"[DB] 收尾写入失败：{exc}")
 
     print()
     print("决策链（缺口驱动）")
@@ -404,17 +405,18 @@ def stage2(args: argparse.Namespace, session) -> int:
     print(_line("="))
     print(f"JSON：{json_path}")
     print(f"Markdown：{md_path}")
-    print(f"运行轨迹：{trace_path}（{len(investigator.tracer.records)} 条事件）")
+    if trace_path:
+        print(f"运行轨迹：{trace_path}（{outcome.trace_events} 条事件）")
     if run_id:
         print(f"数据库  ：{run_id}")
         print(f"          查看留存：uv run python main.py --show {run_id}")
-    stats = investigator.llm.stats()
-    if stats["llm_calls"] or stats["llm_failures"]:
+    if outcome.llm_calls or outcome.llm_failures:
         print(
-            f"模型调用：成功 {stats['llm_calls']} 次｜失败尝试 {stats['llm_failures']} 次"
-            f"｜累计 {stats['llm_ms'] / 1000:.1f} 秒"
+            f"模型调用：成功 {outcome.llm_calls} 次｜失败尝试 {outcome.llm_failures} 次"
+            f"｜累计 {outcome.llm_ms / 1000:.1f} 秒"
         )
-        print(f"         明细：uv run python main.py --trace {trace_path}")
+        if trace_path:
+            print(f"         明细：uv run python main.py --trace {trace_path}")
 
     m = inv.metrics
     from agent.investigator import REAL_EVIDENCE_KINDS
@@ -453,7 +455,7 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
     from datetime import datetime
 
     from agent.investigator import LLMClient
-    from factcheck.runner import run_factcheck
+    from workflow import RunContext, build_sinks, execute_factcheck
 
     print_header(None)
 
@@ -494,56 +496,52 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
 
     trace_path = None
     tracer = None
-    db_sink = None
     if client.available and args.semantic is not False:
         trace_path = OUTPUT_DIR / f"trace_factcheck_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
-        tracer, db_sink = build_tracer(trace_path, store, run_id, stage_id)
+        tracer, _ = build_sinks(trace_path, store, run_id, stage_id)
         client.attach_tracer(tracer)
         print(f"[模型] {client.model}（语义判定：引文是否支持说法）")
     elif args.semantic is True:
         print("[模型] 未配置 OPENAI_API_KEY，语义判定将跳过")
 
-    report, json_path, md_path = run_factcheck(
-        args.factcheck,
-        OUTPUT_DIR,
-        do_check=not args.no_check,
-        log=print,
-        llm=client,
-        semantic=args.semantic,
-        semantic_limit=args.semantic_limit,
+    ctx = RunContext(
+        store=store, run_id=run_id, stage_id=stage_id, out_dir=OUTPUT_DIR, log=print
     )
+    try:
+        outcome = execute_factcheck(
+            ctx,
+            claims_path=args.factcheck,
+            do_check=not args.no_check,
+            llm=client,
+            semantic=args.semantic,
+            semantic_limit=args.semantic_limit,
+            update_topic=created_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if store is not None and run_id:
+            store.end_stage(stage_id, "failed", str(exc))
+            store.finish_run(run_id, "failed", error=str(exc))
+        print(f"[核查失败] {type(exc).__name__}: {exc}")
+        return 1
 
-    if tracer is not None:
-        report_tracer_errors(tracer)
+    report = outcome.report
+    json_path, md_path = outcome.json_path, outcome.md_path
+    print_tracer_errors(getattr(tracer, "errors", None) or [])
 
     if store is not None and run_id:
         try:
-            stats = store.save_factcheck(
-                report,
-                run_id,
-                stage_id,
-                checked=not args.no_check,
-                artifacts={"factcheck_md": Path(md_path).read_text(encoding="utf-8")},
-            )
-            if created_run:
-                # 标题要等报告生成后才有；不改的话 --runs 里会显示文件名
-                store.set_run_topic(run_id, _clip(report.title or "事实核查", 80))
             store.end_stage(stage_id, "succeeded")
             store.finish_run(run_id, "succeeded")
+            stats = outcome.stats
             print(
-                f"[DB] 已留存：来源 {stats['sources']}｜机检 {stats['checks']}"
-                f"｜说法 {stats['claims']}｜引用 {stats['citations']}"
+                f"[DB] 已留存：来源 {stats.get('sources', 0)}｜机检 {stats.get('checks', 0)}"
+                f"｜说法 {stats.get('claims', 0)}｜引用 {stats.get('citations', 0)}"
                 f"（run {run_id}）"
             )
-            if db_sink is not None:
-                print(
-                    f"[DB] 轨迹 {db_sink.seq} 条｜模型调用 {db_sink.calls} 次"
-                    f"（题面与输出全文已留存，可逐字复现）"
-                )
         except Exception as exc:  # noqa: BLE001
             store.end_stage(stage_id, "failed", str(exc))
             store.finish_run(run_id, "failed", error=str(exc))
-            print(f"[DB] 写入失败：{exc}")
+            print(f"[DB] 收尾写入失败：{exc}")
 
     s = report.summary
     print()
@@ -594,8 +592,8 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
 # 衔接：把调查产物转成核查待办
 # --------------------------------------------------------------------------- #
 def run_handoff_stage(args: argparse.Namespace) -> int:
-    from agent.handoff import facts_to_claims
     from agent.schemas import Investigation
+    from workflow import RunContext, execute_handoff
 
     print_header(None)
     src = Path(args.handoff)
@@ -610,28 +608,38 @@ def run_handoff_stage(args: argparse.Namespace) -> int:
     print(f"      主题「{inv.topic}」，{len(inv.events)} 个事件，模式 {inv.mode}")
 
     store = open_persistence(args)
-    payload = facts_to_claims(inv, only_events=args.events)
+    run_id = inv.run_id
+    if store is not None and run_id and store.run_summary(run_id) is None:
+        run_id = ""
+    stage_id = ""
+    if store is not None and run_id:
+        prev = store.latest_stage(run_id, "investigate")
+        stage_id = store.begin_stage(run_id, "handoff", input_stage_id=prev)
+
+    ctx = RunContext(
+        store=store, run_id=run_id, stage_id=stage_id, out_dir=OUTPUT_DIR, log=print
+    )
+    try:
+        outcome = execute_handoff(ctx, investigation=inv, only_events=args.events)
+    except Exception as exc:  # noqa: BLE001
+        if stage_id:
+            store.end_stage(stage_id, "failed", str(exc))
+            store.finish_run(run_id, "failed", error=str(exc))
+        print(f"[handoff 失败] {type(exc).__name__}: {exc}")
+        return 1
+
+    payload = outcome.payload
     h = payload["handoff"]
+    out_path = outcome.path
 
-    out_path = OUTPUT_DIR / "claims_handoff.json"
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    if store is not None:
-        run_id = inv.run_id
-        if run_id and store.run_summary(run_id) is None:
-            run_id = ""
-        if run_id:
-            prev = store.latest_stage(run_id, "investigate")
-            stage_id = store.begin_stage(run_id, "handoff", input_stage_id=prev)
-            store.save_artifact(
-                run_id, stage_id, "claims_json",
-                out_path.read_text(encoding="utf-8"),
-            )
-            store.end_stage(stage_id, "succeeded")
-            store.finish_run(run_id, "succeeded", stop_reason=inv.stop_reason)
-            print(f"      [DB] 已挂到 run {run_id}（handoff 阶段）")
-        else:
-            print("      [DB] 这份产物没带 run_id（旧产物或来自别处），未挂到工作流上")
+    if store is None:
+        print("      [DB] 未写数据库（--no-db 或库不可用）")
+    elif stage_id:
+        store.end_stage(stage_id, "succeeded")
+        store.finish_run(run_id, "succeeded", stop_reason=inv.stop_reason)
+        print(f"      [DB] 已挂到 run {run_id}（handoff 阶段）")
+    else:
+        print("      [DB] 这份产物没带 run_id（旧产物或来自别处），未挂到工作流上")
 
     print("[2/2] 抽取待核查说法")
     print(_line())
@@ -793,32 +801,11 @@ def run_llm_stage(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # 持久层：只在阶段边界出现，领域层不 import 它
 # --------------------------------------------------------------------------- #
-def build_tracer(trace_path: Path, store, run_id: str, stage_id: str):
-    """组一个同时写 JSONL 与数据库的轨迹 sink。
-
-    返回 (tracer, db_sink)。`db_sink` 为 None 说明本次只写文件（--no-db 或建 run 失败），
-    调用方据此决定要不要打印数据库侧的统计。
-
-    为什么用 fanout 而不是让 DbSink 直接继承 Tracer：两者职责不同——文件要轻、
-    数据库要全（含模型全文）。分开发事件，各写各的粒度。
-    """
-    from agent.trace import FanoutSink, Tracer
-
-    jsonl = Tracer(trace_path)
-    if store is None or not run_id:
-        return jsonl, None
-    from store.db_sink import DbSink
-
-    db_sink = DbSink(store, run_id, stage_id)
-    return FanoutSink(jsonl, db_sink), db_sink
-
-
-def report_tracer_errors(tracer) -> None:
+def print_tracer_errors(errors: list[str]) -> None:
     """轨迹写库失败时明确告警。
 
     不中断调查（文件产物还在），但必须说出来——否则事后会以为"这一段本来就没记录"。
     """
-    errors = getattr(tracer, "errors", None) or []
     if not errors:
         return
     print(f"[DB] 轨迹写入降级（{len(errors)} 类错误），文件轨迹不受影响：")
@@ -930,6 +917,21 @@ def run_show_stage(args: argparse.Namespace) -> int:
         print(f"  {st['stage']:<12} 第 {st['attempt']} 次  {st['status']:<10} {span}")
         if st["error"]:
             print(f"      错误：{_clip(st['error'], 70)}")
+
+    # 队列信息与阶段是两回事：阶段说"跑过什么"，队列说"还在等什么/为什么没跑"
+    job = summary.get("queue") or store.run_queue(args.show)
+    if job:
+        print()
+        print("队列（最近一次任务）")
+        print(_line())
+        print(
+            f"  {job['stage']:<12} {job['status']:<10} 第 {job['attempts']} 次尝试"
+            f"｜worker {job['worker_id'] or '（未领取）'}"
+        )
+        if job["status"] == "queued":
+            print(f"  前面还有 {job['ahead']} 个任务；消费需要 worker 在跑：uv run python -m worker")
+        if job["error"]:
+            print(f"  错误：{_clip(job['error'], 70)}")
 
     c = summary["counts"]
     print()

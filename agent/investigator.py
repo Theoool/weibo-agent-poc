@@ -315,6 +315,7 @@ class Investigator:
         search_delay: float = 2.5,
         tracer: TraceSink | None = None,
         log=print,
+        should_stop=None,
     ) -> None:
         self.session = session
         self.topic = topic
@@ -327,6 +328,10 @@ class Investigator:
         # 不传就是纯内存 trace（不落盘），便于测试时不产生文件
         self.tracer = tracer or Tracer(None)
         self.log = log
+        # 取消钩子：worker 在每轮补搜的边界问一次"还要继续吗"。
+        # 不做得更细（比如中断正在进行的翻页）是有意的——那会把浏览器的
+        # 半截状态留给下一次运行，比多跑 30 秒代价大得多。
+        self.should_stop = should_stop
         self.llm_disabled = False
         # 让每次模型调用都进同一条 trace，否则只能从 limitations 里看到"失败了"，
         # 看不到失败在第几次尝试、消耗多少、模型实际返回了什么。
@@ -348,6 +353,23 @@ class Investigator:
     def _llm_active(self) -> bool:
         """真能用模型吗？配了 Key 但连通性自检失败时，这里返回 False。"""
         return self.llm.available and not self.llm_disabled
+
+    def _stop_requested(self) -> bool:
+        """外部要求停止吗（取消接口）。只在轮次边界调用。"""
+        if self.should_stop is None:
+            return False
+        try:
+            reason = self.should_stop()
+        except Exception as exc:  # noqa: BLE001
+            # 取消钩子自身出错不能把调查带停：继续跑完比半途而废更安全
+            self.tracer.log("cancel_check_failed", error=str(exc))
+            return False
+        if not reason:
+            return False
+        self.stop_reason = reason
+        self.tracer.log("round_stop", round=self.rounds_used + 1, reason=reason)
+        self.log(f"      停止：{reason}")
+        return True
 
     def run(self) -> Investigation:
         self.tracer.log(
@@ -437,6 +459,8 @@ class Investigator:
         pending: list[tuple[str, str, GapRecord]] = []
         round_no = 2
         while round_no <= self.budget.max_rounds:
+            if self._stop_requested():
+                break
             gaps = detect_gaps(
                 events,
                 self.posts,

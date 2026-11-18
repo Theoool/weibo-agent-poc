@@ -124,11 +124,19 @@ weibo-agent-poc/
 │  ├─ db_sink.py            # DbSink：轨迹行 + 模型题面/输出全文落库
 │  ├─ blobs.py              # 内容寻址存储，长正文走 artifacts/ 而不是 SQLite
 │  └─ importer.py           # 历史产物导入（标记 degraded）
-├─ api/                     # 只读 HTTP 层（M3）：查 run / 证据 / 轨迹 / 报告
+├─ workflow/                # 阶段执行器：命令行与 worker 共用同一份
+│  ├─ investigate.py        # 调查 → 文件产物 + 入库
+│  ├─ handoff.py            # 调查产物 → 核查清单（队列里从库里读，不读文件）
+│  ├─ factcheck.py          # 核查（输入优先取 claims_json artifact）
+│  ├─ sinks.py              # JSONL + 数据库双写
+│  └─ context.py            # RunContext：run_id / stage_id / 输出目录 / 取消钩子
+├─ worker.py                # 队列消费者（M4）：领任务、建阶段、跑、推进下一阶段
+├─ api/                     # HTTP 层：M3 查询 + M4 创建/重跑/取消
 │  ├─ app.py                # app 工厂 + lifespan（建库、关库）
+│  ├─ schemas.py            # 写接口的请求体与预算上限
 │  ├─ deps.py               # 只注入 RunStore，不暴露 session
 │  ├─ __main__.py           # `python -m api --port 8000`
-│  └─ routers/              # runs / documents / reports / trace / health
+│  └─ routers/              # runs / queue / documents / reports / trace / health
 ├─ agent/
 │  ├─ investigator.py       # 调度层：预算、去重、事件归纳、证据复核、落盘
 │  ├─ controller.py         # 缺口判定与补搜计划：什么时候再搜、搜什么、什么时候停
@@ -153,7 +161,9 @@ weibo-agent-poc/
 │  ├─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
 │  ├─ test_store.py         # 持久层：schema 与模型一致、读回逐字一致、分级规则
 │  ├─ test_trace_db.py      # 轨迹入库：全文可复现、失败隔离、坏 sink 不拖垮调查
-│  └─ test_api.py           # 只读 API：结论→原文、抓取历史、报告现渲染、分页
+│  ├─ test_api.py           # 只读 API：结论→原文、抓取历史、报告现渲染、分页
+│  ├─ test_queue.py         # 队列：抢占互斥、租约回收、取消边界、阶段链推进
+│  └─ test_api_queue.py     # 写接口：202 入队、参数越界、重跑沿用预算、队列视图
 ├─ data/                    # SQLite（gitignore）
 ├─ artifacts/               # 内容寻址的长文本（gitignore）
 └─ output/                  # 调查与核查产物（导出视图，gitignore）
@@ -289,7 +299,7 @@ trace 里对应新增 `gaps`、`round_plan`、`round_stop`、`gap_plan_rejected`
 uv run python -m unittest discover -s tests -t . -v
 ```
 
-覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单）、证据引用的行号映射与证据计数，持久层（schema 与模型逐列一致、存读后 `to_markdown()` 逐字一致、短文本内联／长文本走 CAS、坏 sink 不拖垮调查），以及只读 API（结论→原文、抓取次数与版本变化、报告现渲染、分页与 404）——不依赖网络，共 143 例。
+覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单）、证据引用的行号映射与证据计数，持久层（schema 与模型逐列一致、存读后 `to_markdown()` 逐字一致、短文本内联／长文本走 CAS、坏 sink 不拖垮调查），只读 API（结论→原文、抓取次数与版本变化、报告现渲染、分页与 404），以及队列（抢占互斥、租约回收、重试上限、取消边界、阶段链推进、重跑沿用预算）——不依赖网络，共 178 例。
 
 ## 8. 边界：这个程序刻意不做什么
 
@@ -334,7 +344,8 @@ uv run python -m unittest discover -s tests -t . -v
 2. **查询意图分层**：扩展关键词现在只来自 hashtag 频次和榜单条目，产不出"官方回应""质疑/辟谣"这类反向查询，所以"是否存在对立观点"在结构上仍然无法回答。要做需要先定义"哪些反向意图可以机械构造"，而不是让模型自由发挥。
 3. **评测基线**：固定 topic 与人工判定的理想事件集合，每次改工作流跑一遍算召回。没有度量就没法判断改动是变好还是变坏——缺口循环里"证据 ≥3 条"这个阈值目前就是拍的，没有数据支撑。
 
-数据库和 FastAPI 放到这些都稳定之后再引入。
+数据库、API 与队列已经落地（见 §13–§15）。剩下的按顺序是：分级落地（A 级备份、C 级清理、索引）、
+历史核查的 `document_id` 回填、以及上面的评测基线。
 
 ## 12. POC 2：事实核查（`--factcheck`）
 
@@ -483,16 +494,17 @@ run_20261118_232238_21138b
 
 ### 与领域层的关系
 
-`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在三个边界：`main.py` 组装时调 `RunStore` 建 run/阶段、`FanoutSink` 把轨迹与模型全文转给 `DbSink`、阶段结束时 `save_investigation` 一次性写入语义层。只读 API 是第四个边界，但它只调 `RunStore` 的读方法，拿不到 session。所以原有的一百多个单测全部继续有效（现为 143 例）。
+`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在阶段边界：`workflow/investigate.py` 在跑完后调 `RunStore.save_investigation` 一次性写入语义层，`FanoutSink` 把轨迹与模型全文转给 `DbSink`。API 与 worker 都只能通过 `RunStore` 改状态，拿不到 session。领域层不含任何 SQL，所以原有的一百多个单测全部继续有效（现为 178 例）。
 
 `tests/test_store.py` 里有一条最关键的用例：**保存后从库里读回，渲染出的 Markdown 必须与原始报告逐字一致**。少存任何一个字段这条就会失败——这是判断 schema 够不够用的硬标准。用 10 份真实历史产物验证过，全部逐字一致。
 
-## 14. 只读 API：把报告里的每个判断查回去
+## 14. API：把报告里的每个判断查回去
 
 ```bash
 uv run python -m api --port 8000      # http://127.0.0.1:8000/docs
 uv run python -m api --db data/workflow.db --port 8010
 uv run python -m api --reload         # 开发用
+uv run python -m worker               # 另开一个进程消费队列（写接口不会自己跑调查）
 ```
 
 默认只监听 `127.0.0.1`：这里能读到未公开的调查中间产物，不该默认暴露到局域网。
@@ -553,3 +565,94 @@ uv run python -m api --reload         # 开发用
   列表给长度和 digest，够判断"是不是同一次调用"；要逐字看就取单条。
 - **拿不到就写 null，不补。** 历史核查的 `document_id`、老 run 的 `provenance.chain`
   都可能是空的，接口说"没有"，而不是用今天的抓取结果去填昨天的空白。
+
+## 15. 把它做成一个服务：队列与 worker
+
+M3 解决的是"查得到"，M4 解决的是"跑得起来"——一条 curl 起一次调查，轮询到完成。
+
+```bash
+# 两个进程，各管一头
+uv run python -m api --port 8000      # HTTP 层：建 run、入队、查询
+uv run python -m worker               # 队列消费者：领任务、跑浏览器、推进阶段
+uv run python -m worker --once        # 只处理一个任务（调试用）
+uv run python -m worker --drain       # 处理到队列为空（放 cron 里）
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/runs \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"APEC","stages":["investigate","handoff"],
+       "options":{"rounds":2,"max_searches":3,"max_posts":12,"min_evidence":2}}'
+```
+
+```json
+{
+  "run_id": "run_20261119_001353_7fbf31",
+  "job_id": "job_20261119_001353_adaa73",
+  "status": "queued",
+  "stages": ["investigate", "handoff"],
+  "queue": {"position": 1, "ahead": 0, "worker_alive": false},
+  "note": "没有检测到在线的 worker，任务会一直排队。启动：uv run python -m worker"
+}
+```
+
+`note` 不是装饰：队列系统最常见的故障就是"东西排进去了但没人消费"，而客户端看到
+的只是一个永远 `queued` 的 run。这里直接说出来，`GET /api/queue` 还给得更细。
+
+### 实测：一次完整的 API 调查
+
+| 阶段 | 耗时 | 产出 |
+|---|---|---|
+| `investigate` | 164s | 31 帖 / 3 事件 / 12 条证据 / 模型 2 次 |
+| `handoff` | 0s | 12 条待核查说法 |
+
+最终 `status=succeeded`，`stop_reason` 是"预算耗尽：搜索次数达上限 3 组"——**停止原因
+从调查阶段传到整条链**，不会因为最后一步 handoff 没话说就丢掉。产物落在
+`output/runs/<run_id>/`（`investigation.json` / `.md` / `claims_handoff.json` / `trace_*.jsonl`），
+不再和别的运行抢同一个文件名。
+
+```bash
+uv run python -m worker --once          # 重跑 handoff
+# 阶段变成 handoff 第 1 次、第 2 次都在：重跑是新增 attempt，不覆盖历史
+```
+
+### 状态机与三条纪律
+
+```
+queued ──→ running ──→ succeeded
+   │          │
+   │          └──→ failed ──(POST /retry)──→ queued
+   └──→ cancelled（还没开始就被取消，不产生阶段记录）
+```
+
+- **业务异常不自动重试。** 处理器抛异常 → 任务 `failed`，等人工 `retry`；只有"租约过期"
+  （进程被杀、机器重启）才自动重排。配置错了重跑一百次还是错，而进程没了是环境问题。
+- **worker 单并发。** 专用 Chrome profile 同一时刻只能被一个进程占用，开线程池只会互相抢锁。
+  要并发就换 Postgres + 多台机器，不是在这个进程里加线程。
+- **取消在轮次边界生效。** 运行中的取消只打标记，由正在跑的那个进程自己收尾——API 单方面
+  改状态会留下"cancelled 但文件写了一半"的记录。
+
+### 四个刻意的实现选择
+
+- **队列单独一张表（`queue_job`）。** 设计稿写的是轮询 `stage_run where status='queued'`，
+  但排队不是一个阶段尝试：没被领走的任务会污染阶段列表，租约每秒在变也不该进审计字段，
+  而"取消一个还没开始的任务"在 `stage_run` 里没有位置。`stage_run` 仍只记录真正执行过的尝试。
+- **领取靠"带条件 UPDATE + rowcount"。** 两个 worker 读到同一行是允许的，第二个 UPDATE
+  因为 `status='queued'` 不再成立而落空，然后重试下一行。不依赖 SQLite 3.35+ 的 `RETURNING`。
+- **`worker_heartbeat` 单独一张表。** 没有它，"一直 queued"和"worker 挂了"在 API 里长得一样。
+  心跳由续租线程每 60 秒发一次——只在领任务时发的话，一条跑 3 分钟的任务会让 `/api/ready`
+  从第 91 秒起谎报"没有在线 worker"。
+- **阶段执行器抽到 `workflow/`。** 命令行和 worker 共用同一份代码。两份实现迟早会分岔，
+  而"API 跑出来的报告和命令行不一样"是最难查的那类 bug。
+
+### 重跑与取消
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/runs/<run_id>/retry      # 默认重跑最近失败的阶段
+curl -X POST http://127.0.0.1:8000/api/runs/<run_id>/retry \
+  -H "Content-Type: application/json" -d '{"stage":"handoff"}'
+curl -X POST http://127.0.0.1:8000/api/runs/<run_id>/cancel
+```
+
+重跑会**沿用上一次任务的预算与参数**，否则两次结果没法对比；并且默认 `priority=5` 插队——
+人工点的重跑比排队里的批量任务急。运行中的 run 不能重跑（409），先取消或等它结束。
