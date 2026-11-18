@@ -31,7 +31,12 @@ __all__ = [
 ]
 
 
-def open_store(db_path: str | Path | None = None) -> tuple[RunStore, list[int]]:
-    """建库并返回 (RunStore, 本次应用的迁移版本)。"""
+def open_store(
+    db_path: str | Path | None = None, blob_dir: str | Path | None = None
+) -> tuple[RunStore, list[int]]:
+    """建库并返回 (RunStore, 本次应用的迁移版本)。
+
+    `blob_dir` 可指定内容寻址目录，测试与 API 用它把数据留在临时目录里。
+    """
     engine, session_factory, applied = open_db(db_path or DEFAULT_DB_PATH)
-    return RunStore(session_factory), applied
+    return RunStore(session_factory, blob_dir=blob_dir), applied

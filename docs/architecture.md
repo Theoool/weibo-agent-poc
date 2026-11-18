@@ -1,12 +1,12 @@
 # 整体架构设计：工作流留存 + 数据分级 + FastAPI
 
-> 状态：设计已确认，M1、M2 已实施（持久层 + 双写 + 历史导入；轨迹与模型调用全文入库）。
+> 状态：设计已确认，M1~M3 已实施（持久层 + 轨迹入库 + 只读 API）。
 > 范围：把当前「文件产物 + JSONL 轨迹」的 POC，改造成「以 run 为聚合根、证据可审计、API 可查询」的服务。
 >
 > 实施进度：
 > - [x] **M1** SQLAlchemy 模型、迁移（v1~v3）、`RunStore`、blobs、历史产物导入、CLI 双写
 > - [x] **M2** `TraceSink` 协议 + `DbSink` + `llm_call` / `trace_event` 落库（迁移 v4）
-> - [ ] **M3** FastAPI 只读层
+> - [x] **M3** FastAPI 只读层（`api/`，同步查询 + 现渲染报告）
 > - [ ] **M4** `POST /runs` + worker 队列
 > - [ ] **M5** 分级落地（备份、清理、索引）
 > - [ ] **M6** 文档收尾 + 回归
@@ -19,6 +19,13 @@
 > 按 §2.4「< 4 KB 存 TEXT」的规则，ping 和短 JSON 的题面都不足 4 KB，指针为空、
 > 内容无处可放 —— 恰好丢掉最短也最常用的那批记录。迁移 v4 补 `prompt_inline` /
 > `response_inline`，语义与 `source_document.text_inline` 一致。
+>
+> M3 再修正两处，都是"字段设计看着够、实际查不通"的问题：
+> - **URL → 文档的匹配必须按 mid 归一。** 帖子正文按 `weibo:<mid>` 归一，核查清单里
+>   登记的却是 `https://m.weibo.cn/detail/<mid>`。只按 canonical 匹配，`claims →
+>   原文` 会永远断链（17 条来源 0 条命中）。`_document_id_for_url()` 现在先试 mid。
+> - **阶段顺序不能只按 `started_at`。** 四个阶段常在同一秒内建完，时间戳相等后
+>   SQLite 的返回顺序不确定，报告与 API 里的阶段顺序会跳。加 `rowid` 兜底。
 
 ---
 
@@ -223,20 +230,23 @@ GET  /api/runs/{id}  →  轮询阶段状态
 
 ### 4.2 接口
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/api/runs` | 创建并排队一次工作流 |
-| GET | `/api/runs` | 列表（topic / status / 时间过滤） |
-| GET | `/api/runs/{id}` | 概览：阶段状态 + 指标 + 停止原因 |
-| GET | `/api/runs/{id}/stages` | 四段状态与耗时 |
-| POST | `/api/runs/{id}/retry` | 从失败阶段重跑（attempt+1） |
-| GET | `/api/runs/{id}/report?format=md\|json` | 产物（从 B 级现渲染） |
-| GET | `/api/runs/{id}/trace` | trace 事件（分页） |
-| GET | `/api/runs/{id}/llm-calls` | 模型调用，含失败原因与全文链接 |
-| GET | `/api/runs/{id}/gaps` | 缺口决策链 |
-| GET | `/api/documents/{id}` | 证据快照（正文 + hash + 抓取时刻） |
-| GET | `/api/documents/{id}/fetches` | 同一 URL 的历史版本与差异 |
-| GET | `/api/health` · `/api/ready` | 存活 / 依赖检查（DB、Chrome profile、模型 Key） |
+| 方法 | 路径 | 状态 | 说明 |
+|---|---|---|---|
+| POST | `/api/runs` | M4 | 创建并排队一次工作流 |
+| GET | `/api/runs` | ✅ | 列表（topic / 分页过滤） |
+| GET | `/api/runs/{id}` | ✅ | 概览：阶段状态 + 指标 + 停止原因 + `provenance` |
+| GET | `/api/runs/{id}/stages` | ✅ | 四段状态与耗时 |
+| POST | `/api/runs/{id}/retry` | M4 | 从失败阶段重跑（attempt+1） |
+| GET | `/api/runs/{id}/report?format=md\|json` | ✅ | 产物，**从 B 级现渲染**（`X-Report-Source` 说明来源） |
+| GET | `/api/runs/{id}/trace` | ✅ | trace 事件（按 seq 有序，可分页 / 按 step 过滤） |
+| GET | `/api/runs/{id}/llm-calls` | ✅ | 模型调用列表；默认不含全文，`include_text=true` 才返回 |
+| GET | `/api/llm-calls/{call_id}` | ✅ | 单次调用的题面与输出全文 |
+| GET | `/api/runs/{id}/gaps` | ✅ | 缺口决策链（含 `resolved` 三态统计） |
+| GET | `/api/runs/{id}/claims` | ✅ | 结论 → 引用来源 → `document_id`（M3 验收用） |
+| GET | `/api/runs/{id}/documents` | ✅ | 本次运行抓到的证据元数据（分页） |
+| GET | `/api/documents/{id}` | ✅ | 证据快照（正文 + hash + 抓取时刻 + `excerpt_only`） |
+| GET | `/api/documents/{id}/fetches` | ✅ | 同一 URL 的抓取次数、历史版本与 `content_changed` |
+| GET | `/api/health` · `/api/ready` | ✅ | 存活 / 依赖检查（DB、CAS、模型 Key、Chrome profile） |
 
 请求体：
 
@@ -276,6 +286,18 @@ queued ──→ running ──→ succeeded
 
 代价两条进程一起起。用 `uv run python -m api` + `uv run python -m worker` 两个命令，或一个 `scripts/dev.sh`。
 
+### 4.5 M3 落地时的四个决定
+
+| 决定 | 做法 | 理由 |
+|---|---|---|
+| 读接口拿不到 session | 依赖只注入 `RunStore` | 一旦路由能拿到 session，就会有人在那里写库，只读层名存实亡 |
+| 报告现渲染 | `load_investigation()` → `to_markdown()`，响应头 `X-Report-Source` 标明来源 | 直接吐文件的话，文件与库不一致时没人发现；现渲染顺便校验字段够不够 |
+| `llm-calls` 列表默认无全文 | `include_text=false`，全文走 `/llm-calls/{id}` | 一次 `event_build` 题面 17KB，20 条就是几百 KB，列表会被拖死 |
+| 新增 `/claims` 端点 | 结论 → 引用 → `document_id` | 原设计稿没有，但「这份核查的依据是哪几条帖子原文」必须靠它回答 |
+
+`provenance` 对历史导入的 run 会返回 `note`："无法确定核对的是哪一次调查"。
+这比编一个上游 run_id 诚实——当年确实没记。
+
 ---
 
 ## 5. 与现有代码的接缝
@@ -308,10 +330,11 @@ queued ──→ running ──→ succeeded
 ```
 weibo-agent-poc/
 ├─ main.py                 # CLI（保持不变，加 --db / --import-output）
-├─ worker.py               # 队列消费者（新）
-├─ api/                    # FastAPI（新）
-│  ├─ app.py               # app 工厂 + lifespan
-│  ├─ deps.py              # get_session / get_store
+├─ worker.py               # 队列消费者（新，M4）
+├─ api/                    # FastAPI 只读层（M3，已实现）
+│  ├─ app.py               # app 工厂 + lifespan（建库、关库）
+│  ├─ deps.py              # get_store / require_run（只暴露 RunStore，不暴露 session）
+│  ├─ __main__.py          # `python -m api --port 8000`
 │  └─ routers/{runs,documents,reports,trace,health}.py
 ├─ store/                  # 持久层（新）
 │  ├─ models.py            # SQLAlchemy 2.0 模型

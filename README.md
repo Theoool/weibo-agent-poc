@@ -22,7 +22,7 @@ cd weibo-agent-poc
 uv sync
 ```
 
-`uv sync` 会按 `pyproject.toml` 建 `.venv` 并装好 playwright / openai / pydantic / sqlalchemy / python-dotenv。
+`uv sync` 会按 `pyproject.toml` 建 `.venv` 并装好 playwright / openai / pydantic / sqlalchemy / fastapi / uvicorn / python-dotenv。
 
 用的是本机 Chrome（`channel="chrome"`），**不需要**再下载 Chromium。只有在没有装 Chrome 时才需要：
 
@@ -124,6 +124,11 @@ weibo-agent-poc/
 │  ├─ db_sink.py            # DbSink：轨迹行 + 模型题面/输出全文落库
 │  ├─ blobs.py              # 内容寻址存储，长正文走 artifacts/ 而不是 SQLite
 │  └─ importer.py           # 历史产物导入（标记 degraded）
+├─ api/                     # 只读 HTTP 层（M3）：查 run / 证据 / 轨迹 / 报告
+│  ├─ app.py                # app 工厂 + lifespan（建库、关库）
+│  ├─ deps.py               # 只注入 RunStore，不暴露 session
+│  ├─ __main__.py           # `python -m api --port 8000`
+│  └─ routers/              # runs / documents / reports / trace / health
 ├─ agent/
 │  ├─ investigator.py       # 调度层：预算、去重、事件归纳、证据复核、落盘
 │  ├─ controller.py         # 缺口判定与补搜计划：什么时候再搜、搜什么、什么时候停
@@ -147,7 +152,8 @@ weibo-agent-poc/
 │  ├─ test_factcheck.py     # 引文比对、降级规则、转载不独立、语义只降不升
 │  ├─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
 │  ├─ test_store.py         # 持久层：schema 与模型一致、读回逐字一致、分级规则
-│  └─ test_trace_db.py      # 轨迹入库：全文可复现、失败隔离、坏 sink 不拖垮调查
+│  ├─ test_trace_db.py      # 轨迹入库：全文可复现、失败隔离、坏 sink 不拖垮调查
+│  └─ test_api.py           # 只读 API：结论→原文、抓取历史、报告现渲染、分页
 ├─ data/                    # SQLite（gitignore）
 ├─ artifacts/               # 内容寻址的长文本（gitignore）
 └─ output/                  # 调查与核查产物（导出视图，gitignore）
@@ -283,7 +289,7 @@ trace 里对应新增 `gaps`、`round_plan`、`round_stop`、`gap_plan_rejected`
 uv run python -m unittest discover -s tests -t . -v
 ```
 
-覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单）、证据引用的行号映射与证据计数，以及持久层（schema 与模型逐列一致、存读后 `to_markdown()` 逐字一致、短文本内联／长文本走 CAS、坏 sink 不拖垮调查）——不依赖网络，共 129 例。
+覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单）、证据引用的行号映射与证据计数，持久层（schema 与模型逐列一致、存读后 `to_markdown()` 逐字一致、短文本内联／长文本走 CAS、坏 sink 不拖垮调查），以及只读 API（结论→原文、抓取次数与版本变化、报告现渲染、分页与 404）——不依赖网络，共 143 例。
 
 ## 8. 边界：这个程序刻意不做什么
 
@@ -477,6 +483,73 @@ run_20261118_232238_21138b
 
 ### 与领域层的关系
 
-`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在三个边界：`main.py` 组装时调 `RunStore` 建 run/阶段、`FanoutSink` 把轨迹与模型全文转给 `DbSink`、阶段结束时 `save_investigation` 一次性写入语义层。所以原有的一百多个单测全部继续有效（现为 129 例）。
+`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在三个边界：`main.py` 组装时调 `RunStore` 建 run/阶段、`FanoutSink` 把轨迹与模型全文转给 `DbSink`、阶段结束时 `save_investigation` 一次性写入语义层。只读 API 是第四个边界，但它只调 `RunStore` 的读方法，拿不到 session。所以原有的一百多个单测全部继续有效（现为 143 例）。
 
 `tests/test_store.py` 里有一条最关键的用例：**保存后从库里读回，渲染出的 Markdown 必须与原始报告逐字一致**。少存任何一个字段这条就会失败——这是判断 schema 够不够用的硬标准。用 10 份真实历史产物验证过，全部逐字一致。
+
+## 14. 只读 API：把报告里的每个判断查回去
+
+```bash
+uv run python -m api --port 8000      # http://127.0.0.1:8000/docs
+uv run python -m api --db data/workflow.db --port 8010
+uv run python -m api --reload         # 开发用
+```
+
+默认只监听 `127.0.0.1`：这里能读到未公开的调查中间产物，不该默认暴露到局域网。
+
+| 端点 | 回答什么 |
+|---|---|
+| `GET /api/runs` | 有哪些运行、什么状态、质量是 full 还是 degraded |
+| `GET /api/runs/{id}` | 阶段、指标、停止原因，外加 `provenance`（这份产物从哪来） |
+| `GET /api/runs/{id}/gaps` | 每轮判了什么缺口、补了什么、补上没有（含"无法判定"） |
+| `GET /api/runs/{id}/claims` | 每条结论引了哪几个来源，来源对应哪条原文快照 |
+| `GET /api/runs/{id}/documents` | 这次抓到哪些证据（分页，元数据） |
+| `GET /api/documents/{id}` | 证据全文 + hash + 抓取时刻 + `excerpt_only` |
+| `GET /api/documents/{id}/fetches` | 被抓过几次、有过几个版本、`content_changed` |
+| `GET /api/runs/{id}/trace` | 轨迹事件（有序，可按 step 过滤、分页） |
+| `GET /api/runs/{id}/llm-calls` | 模型调用（默认不含全文） |
+| `GET /api/llm-calls/{id}` | 一次调用的题面与输出全文 |
+| `GET /api/runs/{id}/report?format=md\|json` | 报告，**从库里现渲染** |
+| `GET /api/health` · `/api/ready` | 存活 / 依赖检查 |
+
+### 两个验收问题，用真实数据回答
+
+**「这份核查报告核的是哪一次调查？」**
+
+```json
+{
+  "run_id": "run_20261118_235312_0aea23",
+  "quality": "full",
+  "investigate_stage_id": null,
+  "factcheck_stage_id": "stg_20261118_235312_7cda09",
+  "chain": [{"stage": "factcheck", "stage_id": "stg_...", "attempt": 1}],
+  "note": "该 run 只有核查阶段，且没有登记上游调查：历史产物当年靠固定文件名串接，无法确定核对的是哪一次调查。"
+}
+```
+
+同一次 `--agent` 里跑完调查和核查时，`chain` 是 `investigate → handoff → factcheck`，
+`investigate_stage_id` 有值。**历史导入的老报告没有这条链，接口如实说"无法确定"，不编一个上游 id。**
+
+**「这条结论的依据是哪条帖子原文？」**
+
+```json
+{"count": 13, "linked_sources": 19, "items": [{
+  "claim_key": "C1", "effective": "待核查",
+  "sources": [{
+    "source_key": "S2", "publisher": "央视新闻", "support": "unknown",
+    "document_id": "doc_20261118_230702_b9fc76", "document_available": true
+  }]
+}]}
+```
+
+再 `GET /api/documents/doc_...` 就拿到全文快照；`GET /api/documents/doc_.../fetches`
+会告诉你「被抓过 4 次、1 个版本、内容没变」。
+
+### 三个刻意的实现选择
+
+- **报告现渲染。** `?format=md` 走 `load_investigation().to_markdown()`，响应头
+  `X-Report-Source: rendered:investigation` 说明来源。直接吐文件的话，文件与库不一致没人能发现。
+- **`llm-calls` 列表默认不带全文。** 一次 `event_build` 的题面 17KB，20 条会把响应拖到几百 KB。
+  列表给长度和 digest，够判断"是不是同一次调用"；要逐字看就取单条。
+- **拿不到就写 null，不补。** 历史核查的 `document_id`、老 run 的 `provenance.chain`
+  都可能是空的，接口说"没有"，而不是用今天的抓取结果去填昨天的空白。

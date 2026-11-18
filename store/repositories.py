@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import uuid
 from datetime import datetime
@@ -23,7 +24,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from agent.schemas import (
@@ -114,6 +115,21 @@ def name_key(name: str) -> str:
 
 def _host_of(url: str) -> str:
     return urlsplit(url or "").netloc.lower()
+
+
+#: 微博详情页的 mid：`/detail/5366736759032400` 或 `/status/5366736759032400`
+_MID_IN_URL = re.compile(r"/(?:detail|status)/(\d{6,})")
+
+
+def mid_from_url(url: str) -> str:
+    """从详情页 URL 里取 mid。
+
+    需要它是因为 `canonical_url` 对"有 mid 的帖子"统一成 `weibo:<mid>`，
+    而核查清单里登记的是原始 URL。不补这一步，`source_check → document`
+    永远匹配不上，M3 那个"结论 → 原文"的问题就答不了。
+    """
+    match = _MID_IN_URL.search(url or "")
+    return match.group(1) if match else ""
 
 
 def _dumps(value) -> str:
@@ -329,6 +345,25 @@ class RunStore:
                 )
             )
         return doc_id
+
+    def _document_id_for_url(self, s: Session, url: str) -> str | None:
+        """按 URL 找已有的全文快照。mid 优先——同一条帖子有三种地址写法。"""
+        keys: list[str] = []
+        mid = mid_from_url(url)
+        if mid:
+            keys.append(f"weibo:{mid}")
+        canonical = canonical_url(url, "")
+        if canonical and canonical not in keys:
+            keys.append(canonical)
+        for key in keys:
+            row = s.execute(
+                select(SourceDocument)
+                .where(SourceDocument.url_canonical == key)
+                .order_by(SourceDocument.first_seen_at.desc())
+            ).scalars().first()
+            if row is not None:
+                return row.id
+        return None
 
     def _doc_of_evidence(
         self,
@@ -576,15 +611,7 @@ class RunStore:
             for src in report.sources:
                 sid = new_id("src")
                 src_ids[src.id] = sid
-                doc_id = None
-                canonical = canonical_url(src.url, "")
-                if canonical:
-                    doc = s.execute(
-                        select(SourceDocument)
-                        .where(SourceDocument.url_canonical == canonical)
-                        .limit(1)
-                    ).scalars().first()
-                    doc_id = doc.id if doc else None
+                doc_id = self._document_id_for_url(s, src.url)
                 s.add(
                     FactcheckSource(
                         id=sid,
@@ -782,14 +809,14 @@ class RunStore:
             s.commit()
         return call_id
 
-    def _llm_call_dict(self, row: LLMCall) -> dict:
+    def _llm_call_dict(self, row: LLMCall, include_text: bool = True) -> dict:
         def full_text(inline: str | None, ref: str) -> str:
             if ref:
                 return self.blobs.get_text(ref)
             return inline or ""
 
-        prompt = full_text(row.prompt_inline, row.prompt_ref)
-        response = full_text(row.response_inline, row.response_ref)
+        prompt = full_text(row.prompt_inline, row.prompt_ref) if include_text else ""
+        response = full_text(row.response_inline, row.response_ref) if include_text else ""
         return {
             "id": row.id,
             "purpose": row.purpose,
@@ -811,7 +838,9 @@ class RunStore:
             "response": response,
         }
 
-    def load_llm_calls(self, run_id: str, limit: int = 200) -> list[dict]:
+    def load_llm_calls(
+        self, run_id: str, limit: int = 200, offset: int = 0, include_text: bool = True
+    ) -> list[dict]:
         with self.Session() as s:
             rows = list(
                 s.execute(
@@ -819,16 +848,32 @@ class RunStore:
                     .where(LLMCall.run_id == run_id)
                     .order_by(LLMCall.created_at, LLMCall.id)
                     .limit(limit)
+                    .offset(offset)
                 ).scalars()
             )
-            return [self._llm_call_dict(r) for r in rows]
+            return [self._llm_call_dict(r, include_text=include_text) for r in rows]
+
+    def count_llm_calls(self, run_id: str) -> int:
+        with self.Session() as s:
+            return int(
+                s.execute(
+                    select(func.count()).select_from(LLMCall).where(LLMCall.run_id == run_id)
+                ).scalar()
+                or 0
+            )
 
     def load_llm_call(self, call_id: str) -> dict | None:
         with self.Session() as s:
             row = s.get(LLMCall, call_id)
             return self._llm_call_dict(row) if row is not None else None
 
-    def load_trace(self, run_id: str, limit: int = 5000, step: str | None = None) -> list[dict]:
+    def load_trace(
+        self,
+        run_id: str,
+        limit: int = 5000,
+        step: str | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
         """按 JSONL 的同一形状读回轨迹，让查看器只写一套渲染。
 
         `step` 过滤在这里做而不是调用方做：轨迹条数会随轮次线性增长，
@@ -839,9 +884,18 @@ class RunStore:
             if step:
                 q = q.where(TraceEvent.step == step)
             rows = list(
-                s.execute(q.order_by(TraceEvent.seq, TraceEvent.id).limit(limit)).scalars()
+                s.execute(
+                    q.order_by(TraceEvent.seq, TraceEvent.id).limit(limit).offset(offset)
+                ).scalars()
             )
         return [{"ts": r.ts, "step": r.step, **_loads(r.payload_json, {})} for r in rows]
+
+    def count_trace(self, run_id: str, step: str | None = None) -> int:
+        with self.Session() as s:
+            q = select(func.count()).select_from(TraceEvent).where(TraceEvent.run_id == run_id)
+            if step:
+                q = q.where(TraceEvent.step == step)
+            return int(s.execute(q).scalar() or 0)
 
     def set_run_topic(self, run_id: str, topic: str) -> None:
         """核查阶段的 run 先按文件名建出来，报告标题要等跑完才知道。
@@ -1030,7 +1084,9 @@ class RunStore:
                 for x in s.execute(
                     select(StageRun)
                     .where(StageRun.run_id == run_id)
-                    .order_by(StageRun.started_at)
+                    # started_at 只到秒：三个阶段常常同一秒内建完，再按 rowid 兜底，
+                    # 否则顺序由 SQLite 心情决定，报告里的阶段顺序会跳来跳去
+                    .order_by(StageRun.started_at, text("stage_run.rowid"))
                 ).scalars()
             ]
             stage_ids = [x["id"] for x in stages]
@@ -1086,9 +1142,14 @@ class RunStore:
                 "metrics": metrics,
             }
 
-    def list_runs(self, limit: int = 20, topic: str | None = None) -> list[dict]:
+    def list_runs(self, limit: int = 20, topic: str | None = None, offset: int = 0) -> list[dict]:
         with self.Session() as s:
-            q = select(WorkflowRun).order_by(WorkflowRun.started_at.desc()).limit(limit)
+            q = (
+                select(WorkflowRun)
+                .order_by(WorkflowRun.started_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
             if topic:
                 q = q.where(WorkflowRun.topic.contains(topic))
             rows = list(s.execute(q).scalars())
@@ -1110,3 +1171,301 @@ class RunStore:
                     }
                 )
             return out
+
+    # ---------------------------------------------------------------- 只读视图
+    # 这些方法只服务 API，不改任何状态。分开的理由：写入路径要小心事务，
+    # 读取路径要方便分页与拼装，混在一起两边都会被对方的约束拖住。
+    def run_provenance(self, run_id: str) -> dict | None:
+        """这份产物是从哪来的。
+
+        M3 的验收问题之一是「这份核查报告核的是哪一次调查」。答案有两层：
+        - 新运行：核查与调查在同一个 run 里，`investigate` 阶段就是上游；
+        - 历史导入：当年靠固定文件名串接，只有 `config_json.source_run_id`
+          可能记得上游，多数时候是空的 —— 这时如实说"没有链"，不猜。
+        """
+        with self.Session() as s:
+            run = s.get(WorkflowRun, run_id)
+            if run is None:
+                return None
+            stages = list(
+                s.execute(
+                    select(StageRun)
+                    .where(StageRun.run_id == run_id)
+                    .order_by(StageRun.started_at, text("stage_run.rowid"))
+                ).scalars()
+            )
+            by_id = {x.id: x for x in stages}
+            chain: list[dict] = []
+            seen: set[str] = set()
+            cur = stages[-1] if stages else None
+            while cur is not None and cur.id not in seen:
+                seen.add(cur.id)
+                chain.append(
+                    {"stage": cur.stage, "stage_id": cur.id, "attempt": cur.attempt}
+                )
+                cur = by_id.get(cur.input_stage_id or "")
+            chain.reverse()
+
+            config = _loads(run.config_json, {}) or {}
+            investigate = next((x for x in reversed(stages) if x.stage == "investigate"), None)
+            factcheck = next((x for x in reversed(stages) if x.stage == "factcheck"), None)
+            note = ""
+            if factcheck is not None and investigate is None:
+                note = (
+                    "该 run 只有核查阶段，且没有登记上游调查：历史产物当年靠固定文件名串接，"
+                    "无法确定核对的是哪一次调查。"
+                )
+            return {
+                "run_id": run.id,
+                "topic": run.topic,
+                "trigger": run.trigger,
+                "quality": run.quality,
+                "investigate_stage_id": investigate.id if investigate else None,
+                "factcheck_stage_id": factcheck.id if factcheck else None,
+                # 旧产物导入时写在 config 里的上游提示，可能为空
+                "source_run_id": str(config.get("source_run_id") or ""),
+                "chain": chain,
+                "note": note,
+            }
+
+    def list_documents(self, run_id: str, limit: int = 50, offset: int = 0) -> dict:
+        """一次 run 抓到的证据文档（元数据，不含全文）。"""
+        with self.Session() as s:
+            run = s.get(WorkflowRun, run_id)
+            quality = run.quality if run is not None else "full"
+            total = int(
+                s.execute(
+                    select(func.count())
+                    .select_from(DocumentFetch)
+                    .where(DocumentFetch.run_id == run_id)
+                ).scalar()
+                or 0
+            )
+            rows = s.execute(
+                select(DocumentFetch, SourceDocument)
+                .join(SourceDocument, DocumentFetch.document_id == SourceDocument.id)
+                .where(DocumentFetch.run_id == run_id)
+                .order_by(DocumentFetch.fetched_at, DocumentFetch.id)
+                .limit(limit)
+                .offset(offset)
+            ).all()
+            items = []
+            for fetch, doc in rows:
+                items.append(
+                    {
+                        "id": doc.id,
+                        "mid": doc.mid,
+                        "author": doc.author,
+                        "published_at": doc.published_at,
+                        "url": doc.url,
+                        "kind": doc.kind,
+                        "bytes": doc.bytes,
+                        "is_official": bool(doc.is_official),
+                        "detail_verified": bool(doc.detail_verified),
+                        # 有 ref 或内联都算"有可读正文"；degraded 导入的那份
+                        # 只是当年截断后的摘录，用 excerpt_only 标出来，别当全文用
+                        "has_full_text": bool(doc.text_ref or doc.text_inline),
+                        "excerpt_only": quality != "full",
+                        "fetched_at": fetch.fetched_at,
+                        "excerpt": (doc.text_inline or "")[:80],
+                    }
+                )
+            return {"total": total, "quality": quality, "items": items}
+
+    def get_document(self, doc_id: str) -> dict | None:
+        with self.Session() as s:
+            doc = s.get(SourceDocument, doc_id)
+            if doc is None:
+                return None
+            text = self.blobs.get_text(doc.text_ref) if doc.text_ref else (doc.text_inline or "")
+            # 只被 degraded 的 run（历史导入）抓过 = 这段正文是当年截断后的摘录
+            qualities = list(
+                s.execute(
+                    select(WorkflowRun.quality)
+                    .join(DocumentFetch, DocumentFetch.run_id == WorkflowRun.id)
+                    .where(DocumentFetch.document_id == doc_id)
+                ).scalars()
+            )
+            return {
+                "id": doc.id,
+                "url": doc.url,
+                "url_canonical": doc.url_canonical,
+                "mid": doc.mid,
+                "host": doc.host,
+                "kind": doc.kind,
+                "author": doc.author,
+                "published_at": doc.published_at,
+                "content_hash": doc.content_hash,
+                "bytes": doc.bytes,
+                "is_official": bool(doc.is_official),
+                "detail_verified": bool(doc.detail_verified),
+                "first_seen_at": doc.first_seen_at,
+                "storage": "blob" if doc.text_ref else "inline",
+                "excerpt_only": bool(qualities) and all(q != "full" for q in qualities),
+                "text": text,
+            }
+
+    def document_history(self, doc_id: str) -> dict | None:
+        """这条帖子被抓过几次、内容变没变。
+
+        同一 `url_canonical` 出现多个 `content_hash` 就是内容被改过；
+        这里把同 URL 的所有版本都列出来，让"改没改"可判定，而不是靠猜。
+        """
+        doc = self.get_document(doc_id)
+        if doc is None:
+            return None
+        with self.Session() as s:
+            fetches = [
+                {
+                    "id": f.id,
+                    "run_id": f.run_id,
+                    "stage_run_id": f.stage_run_id,
+                    "fetched_at": f.fetched_at,
+                    "http_status": f.http_status,
+                    "source_url": f.source_url,
+                }
+                for f in s.execute(
+                    select(DocumentFetch)
+                    .where(DocumentFetch.document_id == doc_id)
+                    .order_by(DocumentFetch.fetched_at)
+                ).scalars()
+            ]
+            versions = [
+                {
+                    "id": v.id,
+                    "content_hash": v.content_hash,
+                    "bytes": v.bytes,
+                    "first_seen_at": v.first_seen_at,
+                    "is_current": v.id == doc_id,
+                }
+                for v in s.execute(
+                    select(SourceDocument)
+                    .where(SourceDocument.url_canonical == doc["url_canonical"])
+                    .order_by(SourceDocument.first_seen_at)
+                ).scalars()
+            ]
+        return {
+            "document": {
+                k: doc[k]
+                for k in ("id", "url", "url_canonical", "mid", "author", "excerpt_only")
+            },
+            "fetch_count": len(fetches),
+            "fetches": fetches,
+            "version_count": len(versions),
+            "versions": versions,
+            "content_changed": len(versions) > 1,
+        }
+
+    def run_gaps(self, run_id: str) -> list[dict]:
+        with self.Session() as s:
+            stage_ids = select(StageRun.id).where(StageRun.run_id == run_id)
+            rows = list(
+                s.execute(
+                    select(GapRecord)
+                    .where(GapRecord.stage_run_id.in_(stage_ids))
+                    .order_by(GapRecord.round, GapRecord.id)
+                ).scalars()
+            )
+            return [
+                {
+                    "id": g.id,
+                    "round": g.round,
+                    "kind": g.kind,
+                    "target": g.target,
+                    "detail": g.detail,
+                    "action": g.action,
+                    # 三态：True 已补齐 / False 仍缺 / None 无法判定
+                    "resolved": g.resolved,
+                }
+                for g in rows
+            ]
+
+    def run_claims(self, run_id: str) -> list[dict]:
+        """核查结论 + 它引用的来源 + 来源对应的原文快照 id。
+
+        这是「这份核查的依据是哪几条帖子原文」的实现：`citation → factcheck_source
+        → document_id`，再配合 `GET /api/documents/{id}` 拿到全文。
+        历史导入的核查多数拿不到 document_id（当年没存 URL 归一后的文档），
+        这时 `document_id` 为 null，`quote` 仍然在，能看出"当时引的是哪一段"。
+        """
+        with self.Session() as s:
+            stage_ids = select(StageRun.id).where(StageRun.run_id == run_id)
+            claims = list(
+                s.execute(
+                    select(ClaimCheck)
+                    .where(ClaimCheck.stage_run_id.in_(stage_ids))
+                    .order_by(ClaimCheck.seq)
+                ).scalars()
+            )
+            out: list[dict] = []
+            for c in claims:
+                sources: list[dict] = []
+                for cite in s.execute(
+                    select(Citation)
+                    .where(Citation.claim_id == c.id)
+                    .order_by(Citation.side, Citation.id)
+                ).scalars():
+                    src = s.get(FactcheckSource, cite.source_id)
+                    if src is None:
+                        # 引用了未登记来源：报告里本来就该暴露，这里不补一条假的
+                        sources.append(
+                            {
+                                "source_key": "",
+                                "missing": True,
+                                "side": cite.side,
+                                "point": cite.point,
+                                "support": cite.support,
+                                "reason": cite.support_reason,
+                            }
+                        )
+                        continue
+                    sources.append(
+                        {
+                            "source_key": src.source_key,
+                            "publisher": src.publisher,
+                            "title": src.title,
+                            "url": src.url,
+                            "kind": src.kind,
+                            "quote": src.quote,
+                            "side": cite.side,
+                            "point": cite.point,
+                            "support": cite.support,
+                            "reason": cite.support_reason,
+                            "document_id": src.document_id,
+                            "document_available": bool(src.document_id),
+                        }
+                    )
+                out.append(
+                    {
+                        "claim_key": c.claim_key or c.id,
+                        "claim": c.claim,
+                        "report_line": c.report_line,
+                        "verdict": c.verdict,
+                        "final_verdict": c.final_verdict,
+                        # 对外只用这个，避免"字段说 A、正文说 B"
+                        "effective": c.final_verdict or c.verdict,
+                        "confidence": c.confidence,
+                        "analysis": c.analysis,
+                        "citation_check": c.citation_check,
+                        "semantic_note": c.semantic_note,
+                        "cross_conflict": bool(c.cross_conflict),
+                        "cross_conflict_reason": c.cross_conflict_reason,
+                        "independent_groups": c.independent_groups,
+                        "downgraded": bool(c.downgraded),
+                        "semantic_revised": bool(c.semantic_revised),
+                        "handoff_fact_id": c.handoff_fact_id,
+                        "sources": sources,
+                    }
+                )
+            return out
+
+    def close(self) -> None:
+        """释放连接池。API 进程退出与测试清理都要调，否则 Windows 删不掉 .db。"""
+        try:
+            self.engine.dispose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def engine(self):
+        return self.Session.kw["bind"]

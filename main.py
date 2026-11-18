@@ -30,6 +30,9 @@
 8) 把改造前的历史产物导入数据库（标记 degraded）
    uv run python main.py --import-output output
 
+只读 API（独立进程，查 run / 证据 / 轨迹 / 报告）：
+   uv run python -m api --port 8000
+
 默认会写数据库（data/workflow.db）；加 --no-db 可只产出文件。
 """
 
