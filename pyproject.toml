@@ -1,0 +1,17 @@
+[project]
+name = "weibo-agent-poc"
+version = "0.1.0"
+description = "微博舆情调查 Agent POC（Playwright + 专用 Chrome Profile + 可选 OpenAI Agent）"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.48.0",
+    "openai>=1.60.0",
+    "python-dotenv>=1.0.1",
+    "pydantic>=2.7.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

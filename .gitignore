@@ -1,0 +1,15 @@
+# 依赖与虚拟环境
+.venv/
+__pycache__/
+*.pyc
+
+# 专用 Chrome Profile（含微博登录 Cookie，绝对不要提交）
+.chrome-profile/
+
+# 调查产物
+output/*.json
+output/*.md
+!output/.gitkeep
+
+# 本地密钥
+.env
