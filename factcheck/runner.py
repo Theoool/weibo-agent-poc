@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .schemas import ClaimCheck, FactCheckReport, Source
+from .semantic import run_semantic
 from .verify import check_source
 
 KIND_LABEL = {
@@ -21,6 +22,14 @@ KIND_LABEL = {
     "media": "媒体报道（有采访或编辑流程）",
     "social_post": "社交平台用户发言",
     "aggregator": "聚合站/百科/AI 生成摘要",
+}
+
+SUPPORT_LABEL = {
+    "supports": "支持",
+    "partial": "部分支持",
+    "unrelated": "不相关",
+    "contradicts": "相反",
+    "insufficient": "信息不足",
 }
 
 
@@ -70,7 +79,37 @@ def check_all_sources(
     log(f"      可达 {ok}/{len(todo)}；引文命中 {hit}/{len(todo)}")
 
 
-def apply_checks(report: FactCheckReport) -> None:
+def _apply_semantic(claim: ClaimCheck) -> None:
+    """把"引文是否支持说法"落到结论上。
+
+    纪律：模型只能让结论变弱，不能变强。所以这里没有"升级"分支——
+    「已证实」必须由独立信源数量支撑，不能因为模型说"看起来很支持"就给。
+    """
+    kind = claim.citation_check
+    if kind == "not_run":
+        return
+    if claim.verdict == "待核查":
+        # 待核查本来就没下结论，语义判定只作为展示信息，不改判定
+        return
+    if kind in ("unrelated", "conflicting"):
+        claim.downgraded = True
+        claim.final_verdict = "无法证实"
+        claim.confidence = "低"
+        reason = (
+            "登记的支持来源与说法不对应，引文只是在讲同一主题"
+            if kind == "unrelated"
+            else "所引来源的原文与说法相反"
+        )
+        claim.analysis += f"（语义降级：{reason}，详见「引文与说法的关系」）"
+        return
+    if claim.cross_conflict and claim.independent_groups >= 2:
+        # 两个以上互不相同的来源在同一事实上对不上，正是原报告「存在矛盾」的含义
+        claim.final_verdict = "存在矛盾"
+        claim.semantic_revised = True
+        claim.analysis += "（语义判定：两条以上独立来源在同一事实上互相矛盾，详见「来源间矛盾」）"
+
+
+def apply_checks(report: FactCheckReport, checked: bool = True) -> None:
     """把来源校验结果灌进结论：支持来源全挂 → 结论自动降级为无法证实。"""
     by_id = {s.id: s for s in report.sources}
     for claim in report.claims:
@@ -82,11 +121,14 @@ def apply_checks(report: FactCheckReport) -> None:
             if src is None:
                 failed.append(f"{cite.source_id}（未登记）")
                 continue
+            if not checked:
+                # 没跑机检就不能判"未通过"，否则会把所有结论误降到"无法证实"
+                continue
             if src.reachable and src.quote_found is not False:
                 verified.append(src.id)
                 ok_groups.add(_group_of(src))
             else:
-                failed.append(f"{src.id}（{src.check_note}）")
+                failed.append(f"{src.id}（{src.check_note or '未记录原因'}）")
         claim.verified_sources = verified
         claim.failed_sources = failed
         claim.independent_groups = len(ok_groups)
@@ -96,7 +138,7 @@ def apply_checks(report: FactCheckReport) -> None:
         if claim.verdict == "待核查":
             continue
 
-        if claim.supporting and not verified:
+        if checked and claim.supporting and not verified:
             claim.downgraded = True
             claim.final_verdict = "无法证实"
             claim.confidence = "低"
@@ -105,9 +147,16 @@ def apply_checks(report: FactCheckReport) -> None:
                 f"原判定「{claim.verdict}」不成立）"
             )
 
-    report.mode = (
-        "机检 + 自动抽取（待人工复核）" if report.handoff else "机检 + 人工判定"
-    )
+        # 机检优先，语义判定在此基础上再收紧
+        _apply_semantic(claim)
+
+    # 跳过机检时不能声称"已机检"——报告里写做过的事必须真做过
+    if checked:
+        report.mode = (
+            "机检 + 自动抽取（待人工复核）" if report.handoff else "机检 + 人工判定"
+        )
+    else:
+        report.mode = "人工判定（未机检）"
 
 
 def build_summary(report: FactCheckReport, notes: dict) -> dict:
@@ -142,6 +191,17 @@ def build_summary(report: FactCheckReport, notes: dict) -> dict:
         "sources_checked": len(report.sources),
         "sources_reachable": sum(1 for s in report.sources if s.reachable),
         "sources_quote_hit": sum(1 for s in report.sources if s.quote_found),
+        # 语义层：引文与说法的对应关系，和"结论"是两件事，分开统计
+        "semantic_checked": len([c for c in claims if c.citation_check != "not_run"]),
+        "citation_supported": len(
+            [c for c in claims if c.citation_check in ("supported", "partial")]
+        ),
+        "citation_unrelated": len([c for c in claims if c.citation_check == "unrelated"]),
+        "citation_conflicting": len([c for c in claims if c.citation_check == "conflicting"]),
+        "citation_insufficient": len(
+            [c for c in claims if c.citation_check == "insufficient"]
+        ),
+        "semantic_revised": len([c for c in claims if c.semantic_revised]),
         **notes,
     }
 
@@ -152,13 +212,33 @@ def to_markdown(report: FactCheckReport) -> str:
     lines = [f"# {report.title}", ""]
     lines += [
         f"- 核查时间：{report.checked_at:%Y-%m-%d %H:%M:%S}",
-        f"- 核查方式：{report.mode}（每个来源均已机检链接可达性与引文命中）",
+        f"- 核查方式：{report.mode}"
+        + ("" if "未机检" in report.mode else "（每个来源均已机检链接可达性与引文命中）"),
         f"- 被核查对象：{report.original_report or '（未注明）'}",
-        f"- 来源校验：登记 {s.get('sources_checked', 0)} 个｜可达 {s.get('sources_reachable', 0)} 个"
-        f"｜引文命中 {s.get('sources_quote_hit', 0)} 个",
+        (
+            f"- 来源校验：登记 {s.get('sources_checked', 0)} 个｜可达 {s.get('sources_reachable', 0)} 个"
+            f"｜引文命中 {s.get('sources_quote_hit', 0)} 个"
+            if "未机检" not in report.mode
+            else f"- 来源校验：登记 {s.get('sources_checked', 0)} 个（本次未机检）"
+        ),
+    ]
+    if s.get("semantic_checked"):
+        lines.append(
+            f"- 语义判定：{s['semantic_checked']} 条说法已判定引文与说法的关系"
+            f"（支持/部分支持 {s.get('citation_supported', 0)}｜不相关 {s.get('citation_unrelated', 0)}"
+            f"｜相反 {s.get('citation_conflicting', 0)}｜信息不足 {s.get('citation_insufficient', 0)}）"
+        )
+    else:
+        sem = report.semantic or {}
+        reason = sem.get("reason") or "未执行"
+        lines.append(f"- 语义判定：未执行（{reason}）——引文与说法是否对应只能人工看")
+    lines += [
         "",
         "> 核查纪律：微博用户转述不作为事实依据；多家转载同一稿件只计一个信源；"
         "找不到原始证据一律标“无法证实”，不做善意推定。",
+        "",
+        "> 语义判定的边界：它只回答“这段引文有没有支持这句话”，不判断说法真假，"
+        "也不会把结论升到「已证实」；它只能让结论变弱，判定权仍在证据规则手里。",
         "",
     ]
     if report.handoff:
@@ -236,6 +316,23 @@ def to_markdown(report: FactCheckReport) -> str:
             lines.append("- （无）")
         lines.append("")
 
+        marked = [c for c in claim.supporting if c.support != "unknown"]
+        if marked:
+            lines += ["**引文与说法的关系**（语义判定：只说明引文有没有支持这句话，不参与核查结论）："]
+            for cite in marked:
+                label = SUPPORT_LABEL.get(cite.support, cite.support)
+                lines.append(f"- [{cite.source_id}] {label}：{cite.support_reason or '（未给依据）'}")
+            if claim.semantic_note:
+                lines.append(f"- 总评：{claim.semantic_note}")
+            lines.append("")
+
+        if claim.cross_conflict:
+            lines += [
+                "**来源间矛盾**：",
+                claim.cross_conflict_reason or "（判定存在矛盾，但未说明是哪两条、在哪个事实上）",
+                "",
+            ]
+
         lines += ["**反向证据**："]
         if claim.counter:
             for cite in claim.counter:
@@ -297,23 +394,43 @@ def run_factcheck(
     out_dir: str | Path,
     do_check: bool = True,
     log=print,
+    llm=None,
+    semantic: bool | None = None,
+    semantic_limit: int = 20,
 ) -> tuple[FactCheckReport, Path, Path]:
     report = load_claims(input_path)
-    log(f"[1/3] 载入 {len(report.claims)} 项待核查说法、{len(report.sources)} 个登记来源")
+    log(f"[1/4] 载入 {len(report.claims)} 项待核查说法、{len(report.sources)} 个登记来源")
     if do_check:
-        log("[2/3] 校验来源（链接 + 引文）")
+        log("[2/4] 校验来源（链接 + 引文）")
         check_all_sources(report, log=log)
     else:
         report.mode = "人工判定（跳过机检）"
-    apply_checks(report)
 
-    notes = {}
+    # 语义判定：默认"有模型就跑"，显式 --no-semantic 才关。默认开是有意的——
+    # 这一层正是用来发现"引文与说法无关"这种机检看不见的错误。
+    if semantic is None:
+        semantic = llm is not None and bool(getattr(llm, "available", False))
+    if not semantic:
+        report.semantic = {"enabled": False, "reason": "未启用"}
+        log("[3/4] 跳过语义判定：引文与说法是否对应只能人工判断")
+    elif llm is None or not getattr(llm, "available", False):
+        report.semantic = {"enabled": False, "reason": "模型不可用"}
+        log("[3/4] 跳过语义判定：需要可用的模型（检查 OPENAI_API_KEY / 余额）")
+    else:
+        log("[3/4] 语义判定：引文是否支持说法")
+        report.semantic = run_semantic(report, llm, limit=semantic_limit, log=log)
+        if report.semantic.get("reason"):
+            log(f"      注意：{report.semantic['reason']}")
+
+    apply_checks(report, checked=do_check)
+
+    notes = {"semantic": report.semantic}
     raw = json.loads(Path(input_path).read_text(encoding="utf-8"))
     notes["opinion_as_fact"] = raw.get("opinion_as_fact", "")
     notes["should_revise"] = raw.get("should_revise", "")
     report.summary = build_summary(report, notes)
 
-    log("[3/3] 生成报告")
+    log("[4/4] 生成报告")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = Path(input_path).stem

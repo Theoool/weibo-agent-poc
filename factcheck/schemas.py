@@ -16,6 +16,26 @@ from pydantic import BaseModel, Field
 
 Verdict = Literal["已证实", "部分证实", "无法证实", "存在矛盾", "待核查"]
 
+# 引文与说法的关系。由模型标注，但只描述"这段文字说了什么"，不判断说法真假。
+SupportLevel = Literal[
+    "supports",      # 直接支持，引文里有说法所需的关键信息
+    "partial",       # 只支持一部分，缺关键限定（时间/主体/数量）
+    "unrelated",     # 只是同一主题，没有支持关系
+    "contradicts",   # 与说法相反（数字/时间/主体对不上）
+    "insufficient",  # 引文为空或只有标题
+    "unknown",       # 尚未判定
+]
+
+# 一条说法的引文整体成色，由上面逐条标注聚合而来
+CitationCheck = Literal[
+    "not_run",      # 没跑语义判定
+    "supported",    # 至少一条直接支持，且没有不相关/相反
+    "partial",      # 支持与不支持混在一起
+    "unrelated",    # 全部与说法无关
+    "conflicting",  # 至少一条与说法相反
+    "insufficient", # 全部信息不足
+]
+
 # 来源类型：决定它在证据链里的权重
 SourceKind = Literal[
     "official_account",   # 当事人/公司官方账号
@@ -51,6 +71,9 @@ class Source(BaseModel):
 class Cite(BaseModel):
     source_id: str
     point: str = ""
+    # 语义判定结果：这条引文到底支不支持这个说法。只影响证据成色，不直接产出结论。
+    support: SupportLevel = "unknown"
+    support_reason: str = ""
 
 
 class ClaimCheck(BaseModel):
@@ -73,6 +96,16 @@ class ClaimCheck(BaseModel):
     independent_groups: int = 0
     downgraded: bool = False
 
+    # 语义层（模型标注 + 代码聚合）。注意：这部分只描述证据成色，
+    # 结论仍由规则计算，且只有"变弱"这一个方向。
+    citation_check: CitationCheck = "not_run"
+    semantic_note: str = ""
+    # 引文之间是否互相矛盾（同一事实给出不同数字/时间/主体）
+    cross_conflict: bool = False
+    cross_conflict_reason: str = ""
+    # 因"来源互相矛盾"被改写为「存在矛盾」，与机检降级分开记
+    semantic_revised: bool = False
+
     def effective(self) -> str:
         """对外展示和统计都用这个，避免"字段说 A、正文说 B"。"""
         return self.final_verdict or self.verdict
@@ -88,3 +121,5 @@ class FactCheckReport(BaseModel):
     summary: dict = Field(default_factory=dict)
     # 由 handoff 自动生成时的抽取统计（事件数、事实数、无证据事实数）
     handoff: dict = Field(default_factory=dict)
+    # 语义判定的执行情况（是否启用、模型、判定条数、失败原因）
+    semantic: dict = Field(default_factory=dict)

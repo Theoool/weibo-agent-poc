@@ -125,12 +125,13 @@ weibo-agent-poc/
 ├─ factcheck/               # POC 2：事实核查
 │  ├─ claims_ysjf.json      # 待核查说法 + 登记来源（人工维护）
 │  ├─ verify.py             # 链接可达性、引文命中、登录墙识别
+│  ├─ semantic.py           # 受限语义层：引文到底支不支持这句话
 │  ├─ runner.py             # 降级规则、信源独立性计数、报告渲染
 │  └─ schemas.py            # Source / ClaimCheck / 报告模型
 ├─ tests/
 │  ├─ test_parsers.py       # 抓取层纯函数单测（不联网）
-│  ├─ test_factcheck.py     # 引文比对、降级规则、转载不独立
-│  └─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace
+│  ├─ test_factcheck.py     # 引文比对、降级规则、转载不独立、语义只降不升
+│  └─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
 └─ output/                  # 调查与核查产物
 ```
 
@@ -254,7 +255,33 @@ uv run python main.py --handoff output/investigation.json
 uv run python main.py --factcheck output/claims_handoff.json
 ```
 
-不需要模型 Key。输出 `output/claims_ysjf_factcheck.json` + `.md`。
+不需要模型 Key 也能跑（不加 Key 时语义判定自动跳过）。输出 `output/claims_ysjf_factcheck.json` + `.md`。
+
+### 第三道：引文与说法的对应关系（`factcheck/semantic.py`）
+
+前两道机检只能证明“这句话确实出现在那一页”，证明不了“这句话支持这个说法”。实测里就有一条：报告写“发了 PS5 Pro”，引用的帖子通篇在讲放假安排——链接可达、引文也命中，但两者没关系。这种错误人工读一遍能看出来，机检看不出来。
+
+所以加了一层受限的语义判定：模型只标注每条引文与说法的关系——`supports / partial / unrelated / contradicts / insufficient`，代码据此聚合成 `citation_check`（`supported / partial / unrelated / conflicting / insufficient`）。
+
+边界是硬的，全部写在代码里而不是提示词里：
+
+- **模型不产出核查结论**。它没有"判定为已证实"这个选项，报告里的结论仍由 `apply_checks` 按证据规则计算；
+- **只有降级通道**。`_apply_semantic()` 里没有任何升级分支——「已证实」必须由独立信源数量支撑，不会因为模型说"看起来很支持"就给；
+- **来源间矛盾要两个独立信源**。`cross_conflict=true` 且 `independent_groups >= 2` 才改写为「存在矛盾」；同一稿源的两条引文对不上，更可能是表述差异；
+- **待核查不参与改判**。handoff 出来的说法本来就没有结论，语义判定只作为展示信息；
+- **白名单**。模型编出不存在的 `source_id`、或给出非法等级，一律丢弃（和调查层对 mid 的校验同一个道理）；
+- **只喂引文，不喂 URL**。避免模型去"推测"页面内容，等于是拿它的记忆当证据。
+
+报告里会多两段：每条说法的「引文与说法的关系」和（如有）「来源间矛盾」。头部会写明执行情况，跳过时也写明原因，不会假装做过。
+
+```powershell
+uv run python main.py --factcheck output/claims_handoff.json               # 有 Key 就跑语义判定
+uv run python main.py --factcheck output/claims_handoff.json --no-semantic  # 只看机检
+uv run python main.py --factcheck output/claims_handoff.json --no-check     # 只跑语义判定（快速重渲）
+uv run python main.py --factcheck output/claims_handoff.json --semantic-limit 5
+```
+
+实测一条（`C2 影视飓风官方称该解读太恶毒`）：报告登记了 5 条来源，模型判出 1 条支持、1 条部分支持、3 条只提到待遇与吐槽、与"官方回应"无关。机检对这种情况完全无感——链接都可达，引文也都命中。
 
 ### 它真正做的事
 

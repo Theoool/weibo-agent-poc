@@ -327,10 +327,32 @@ def stage2(args: argparse.Namespace, session) -> int:
 # POC 2：事实核查
 # --------------------------------------------------------------------------- #
 def run_factcheck_stage(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    from agent.investigator import LLMClient
+    from agent.trace import Tracer
     from factcheck.runner import run_factcheck
 
     print_header(None)
-    report, json_path, md_path = run_factcheck(args.factcheck, OUTPUT_DIR, log=print)
+
+    client = LLMClient()
+    trace_path = None
+    if client.available and args.semantic is not False:
+        trace_path = OUTPUT_DIR / f"trace_factcheck_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        client.attach_tracer(Tracer(trace_path))
+        print(f"[模型] {client.model}（语义判定：引文是否支持说法）")
+    elif args.semantic is True:
+        print("[模型] 未配置 OPENAI_API_KEY，语义判定将跳过")
+
+    report, json_path, md_path = run_factcheck(
+        args.factcheck,
+        OUTPUT_DIR,
+        do_check=not args.no_check,
+        log=print,
+        llm=client,
+        semantic=args.semantic,
+        semantic_limit=args.semantic_limit,
+    )
 
     s = report.summary
     print()
@@ -353,11 +375,27 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
         f"｜无法证实 {s['unverifiable']} 条｜存在矛盾 {s['contradictory']} 条"
         + (f"｜待核查 {s['pending']} 条" if s.get("pending") else "")
     )
-    print(f"  来源：登记 {s['sources_checked']}｜可达 {s['sources_reachable']}"
-          f"｜引文命中 {s['sources_quote_hit']}")
+    if args.no_check:
+        print(f"  来源：登记 {s['sources_checked']}（本次未机检）")
+    else:
+        print(f"  来源：登记 {s['sources_checked']}｜可达 {s['sources_reachable']}"
+              f"｜引文命中 {s['sources_quote_hit']}")
+    if s.get("semantic_checked"):
+        print(
+            f"  语义：{s['semantic_checked']} 条已判定引文与说法关系"
+            f"｜支持/部分 {s.get('citation_supported', 0)}"
+            f"｜不相关 {s.get('citation_unrelated', 0)}"
+            f"｜相反 {s.get('citation_conflicting', 0)}"
+            f"｜信息不足 {s.get('citation_insufficient', 0)}"
+        )
+    else:
+        print(f"  语义：未执行（{(report.semantic or {}).get('reason') or '未启用'}）")
     print(_line("="))
     print(f"JSON：{json_path}")
     print(f"Markdown：{md_path}")
+    if trace_path is not None and trace_path.exists():
+        print(f"语义轨迹：{trace_path}")
+        print(f"          uv run python main.py --trace {trace_path}")
     return 0
 
 
@@ -504,6 +542,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="TRACE_JSONL",
         help="查看一次运行的轨迹（含每次模型调用），不需要浏览器",
+    )
+    p.add_argument(
+        "--no-check",
+        action="store_true",
+        help="跳过链接可达性与引文机检（只跑语义判定，或用于快速重渲报告）",
+    )
+    p.add_argument(
+        "--semantic",
+        dest="semantic",
+        action="store_true",
+        default=None,
+        help="核查时对每条说法执行引文-说法语义判定（默认：有 Key 就跑）",
+    )
+    p.add_argument(
+        "--no-semantic",
+        dest="semantic",
+        action="store_false",
+        default=None,
+        help="跳过语义判定，只做链接可达性与引文命中机检",
+    )
+    p.add_argument(
+        "--semantic-limit",
+        type=int,
+        default=20,
+        help="语义判定最多处理多少条说法",
     )
     p.add_argument(
         "--handoff",
