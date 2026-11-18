@@ -1,6 +1,6 @@
 """微博舆情调查 Agent POC —— 入口。
 
-六种用法：
+常用用法：
 
 1) 环境自检
    uv run python main.py --doctor
