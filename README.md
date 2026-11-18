@@ -109,7 +109,7 @@ Agent 会做：
 
 ```
 weibo-agent-poc/
-├─ main.py                  # CLI：--doctor / Day-1 / --agent / --handoff / --factcheck
+├─ main.py                  # CLI：--doctor / Day-1 / --agent / --trace / --handoff / --factcheck
 ├─ pyproject.toml
 ├─ .env                     # OPENAI_API_KEY / OPENAI_MODEL（留空即降级）
 ├─ agent/
@@ -173,15 +173,30 @@ uv run python main.py --factcheck output/claims_handoff.json     # 接着核查
 
 **④ 运行轨迹（`agent/trace.py`）**
 
-每次 `--agent` 都会写一份 `output/trace_<时间戳>.jsonl`，逐行记录 `run_start / search / events_built / merge / run_end`。多轮判断之后，同一份输入跑两次结果可能不同，没有 trace 就只能猜差异出在哪一轮。
+每次 `--agent` 都会写一份 `output/trace_<时间戳>.jsonl`，逐行记录 `run_start / llm_mode / search / llm_call / events_built / merge / run_end`。多轮判断之后，同一份输入跑两次结果可能不同，没有 trace 就只能猜差异出在哪一轮。
+
+其中 `llm_call` 是**每一次模型尝试**（含重试）的留痕：`purpose / attempt / ok / duration_ms / request_chars / response_chars / prompt_digest / response_preview`，失败时额外附 `error` 和 `prompt_preview`（题面前 800 字）。这样"模型练坏了"和"喂进去的数据本来就不够"才能分开。
+
+```powershell
+uv run python main.py --trace output/trace_20261118_212101.jsonl
+```
+
+```
+[2/2] 模型调用 4 次（成功 1｜失败 3）｜累计 4.5 秒
+   1. ok   ping                 0.4s  9 → 2 字  digest a1b2c3d4e5f6  第 1 次
+   2. FAIL keyword_plan_r1      3.9s  1204 → 0 字  digest ff00aa11bb22  第 1 次
+      原因：HTTP 402 InsufficientBalance：Insufficient Balance（账户余额不足…）
+```
+
+读法：同一 `purpose` 的 `prompt_digest` 相同，说明两次输入完全一致；此时输出不同才是模型随机性，输出相同而结论不同则是后处理（白名单过滤、合并、降级）的问题。`Investigation.metrics` 里也带了 `llm_calls / llm_failures / llm_ms`，报告头部会显示一行「模型调用：成功 N 次｜失败尝试 M 次」。
 
 ## 7. 单测
 
 ```powershell
-uv run python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -t . -v
 ```
 
-覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并——不依赖网络。
+覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取，以及模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）——不依赖网络。
 
 ## 8. 边界：这个程序刻意不做什么
 

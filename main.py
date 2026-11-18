@@ -1,6 +1,6 @@
 """微博舆情调查 Agent POC —— 入口。
 
-五种用法：
+六种用法：
 
 1) 环境自检
    uv run python main.py --doctor
@@ -12,10 +12,13 @@
 3) 第二阶段：接入 Agent，自主扩展关键词并形成事件
    uv run python main.py --agent --keyword APEC
 
-4) 把调查产物转成核查待办（POC 1 → POC 2 的衔接）
+4) 查看运行轨迹（含每次模型调用，不需要浏览器）
+   uv run python main.py --trace output/trace_20261118_212101.jsonl
+
+5) 把调查产物转成核查待办（POC 1 → POC 2 的衔接）
    uv run python main.py --handoff output/investigation.json
 
-5) 事实核查
+6) 事实核查
    uv run python main.py --factcheck output/claims_handoff.json
 """
 
@@ -289,6 +292,13 @@ def stage2(args: argparse.Namespace, session) -> int:
     print(f"JSON：{json_path}")
     print(f"Markdown：{md_path}")
     print(f"运行轨迹：{trace_path}（{len(investigator.tracer.records)} 条事件）")
+    stats = investigator.llm.stats()
+    if stats["llm_calls"] or stats["llm_failures"]:
+        print(
+            f"模型调用：成功 {stats['llm_calls']} 次｜失败尝试 {stats['llm_failures']} 次"
+            f"｜累计 {stats['llm_ms'] / 1000:.1f} 秒"
+        )
+        print(f"         明细：uv run python main.py --trace {trace_path}")
 
     m = inv.metrics
     print()
@@ -396,6 +406,66 @@ def run_handoff_stage(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# trace 查看：把一次运行的决策链读回来
+# --------------------------------------------------------------------------- #
+def run_trace_stage(args: argparse.Namespace) -> int:
+    from agent.trace import load, summarize
+
+    path = Path(args.trace)
+    print_header(None)
+    if not path.exists():
+        print(f"找不到 trace 文件：{path}")
+        return 2
+    records = load(path)
+    if not records:
+        print(f"{path} 中没有可解析记录")
+        return 2
+
+    s = summarize(records)
+    print(f"[1/2] {path.name}：{s['total']} 条记录")
+    print(_line())
+    for step, n in sorted(s["counts"].items(), key=lambda kv: -kv[1]):
+        print(f"  {step:<20}{n}")
+
+    calls = [r for r in records if r.get("step") == "llm_call"]
+    print()
+    print(
+        f"[2/2] 模型调用 {len(calls)} 次（成功 {s['llm_ok']}｜失败 {s['llm_failed']}）"
+        f"｜累计 {s['llm_ms'] / 1000:.1f} 秒"
+    )
+    print(_line())
+    if calls:
+        for i, rec in enumerate(calls, 1):
+            flag = "ok  " if rec.get("ok") else "FAIL"
+            print(
+                f"  {i:>2}. {flag} {str(rec.get('purpose') or '-'):<18} "
+                f"{rec.get('duration_ms', 0) / 1000:>5.1f}s  "
+                f"{rec.get('request_chars', 0)} → {rec.get('response_chars', 0)} 字  "
+                f"digest {rec.get('prompt_digest', '')}  第 {rec.get('attempt', 1)} 次"
+            )
+            if not rec.get("ok"):
+                error = str(rec.get("error") or "未知")
+                print(f"      原因：{_clip(error, 160)}")
+                preview = str(rec.get("response_preview") or "")
+                # 解析失败时 error 里已经带了返回内容，别重复打一遍
+                if preview and preview[:30] not in error:
+                    print(f"      实际返回：{_clip(preview, 120)}")
+    else:
+        print("  本次没有模型调用（heuristic 模式，或全部走了规则分支）")
+
+    if s["errors"]:
+        print()
+        print("全部错误：")
+        for err in s["errors"]:
+            print(f"  [{err['step']}] {err['purpose'] or '-'}：{_clip(err['error'], 160)}")
+
+    print(_line("="))
+    print("读法：同一 purpose 的 prompt_digest 相同，说明输入完全一致；")
+    print("      此时输出不同才是模型随机性，输出相同但结论不同则是后处理的问题。")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -430,6 +500,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-minutes", type=float, default=10.0, help="Agent 阶段时间上限（分钟）")
     p.add_argument("--detail-checks", type=int, default=2, help="每个事件详情页复核条目数")
     p.add_argument(
+        "--trace",
+        default=None,
+        metavar="TRACE_JSONL",
+        help="查看一次运行的轨迹（含每次模型调用），不需要浏览器",
+    )
+    p.add_argument(
         "--handoff",
         default=None,
         help="把调查产物转成核查待办：传 investigation.json 路径",
@@ -450,6 +526,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.doctor:
         return doctor()
+
+    if args.trace:
+        return run_trace_stage(args)
 
     if args.handoff:
         picked = None

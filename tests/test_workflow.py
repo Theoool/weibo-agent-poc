@@ -13,11 +13,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent.handoff import facts_to_claims
+from agent.investigator import Investigator, LLMClient
 from agent.merge import merge_events, similarity
-from agent.schemas import Event, Evidence, Fact, Investigation
-from agent.trace import Tracer
+from agent.schemas import Event, Evidence, Fact, Investigation, Metrics
+from agent.trace import Tracer, load, summarize
 
 
 class MergeTest(unittest.TestCase):
@@ -170,6 +172,142 @@ class TracerTest(unittest.TestCase):
         t = Tracer(None)
         t.log("x")
         self.assertEqual(len(t.records), 1)
+
+    def test_load_skips_broken_lines(self) -> None:
+        """trace 是用来排查问题的，最后一行被中断不该让整份读不出来。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text('{"step":"a"}\n\n{坏行\n{"step":"b"}\n', encoding="utf-8")
+            self.assertEqual([r["step"] for r in load(path)], ["a", "b"])
+
+    def test_summarize_separates_llm_calls(self) -> None:
+        records = [
+            {"step": "search", "keyword": "APEC"},
+            {"step": "llm_call", "ok": True, "duration_ms": 100, "purpose": "event_build"},
+            {
+                "step": "llm_call",
+                "ok": False,
+                "duration_ms": 50,
+                "purpose": "event_build",
+                "error": "HTTP 402",
+            },
+        ]
+        s = summarize(records)
+        self.assertEqual(s["llm_calls"], 2)
+        self.assertEqual(s["llm_ok"], 1)
+        self.assertEqual(s["llm_failed"], 1)
+        self.assertEqual(s["llm_ms"], 150)
+        self.assertEqual(s["llm_purposes"], {"event_build": 2})
+        self.assertEqual(len(s["errors"]), 1)
+
+
+class _FakeCompletions:
+    """按次序返回预设内容，或始终抛同一个异常。"""
+
+    def __init__(self, contents=None, exc=None) -> None:
+        self.contents = list(contents or [])
+        self.exc = exc
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        idx = min(self.calls - 1, len(self.contents) - 1)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.contents[idx]))]
+        )
+
+
+def _stub_client(contents=None, exc=None) -> LLMClient:
+    client = LLMClient(api_key="test-key")
+    client.available = True
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=_FakeCompletions(contents, exc))
+    )
+    return client
+
+
+class LLMTraceTest(unittest.TestCase):
+    """模型调用必须留痕：否则只能看到"失败了"，看不到失败在第几次、返回了什么。"""
+
+    def test_success_is_recorded_with_purpose(self) -> None:
+        tracer = Tracer(None)
+        client = _stub_client(['{"keywords": ["A"]}'])
+        client.attach_tracer(tracer)
+        out = client.chat_json("sys", "user", purpose="keyword_plan_r1")
+        self.assertEqual(out, {"keywords": ["A"]})
+        rec = [r for r in tracer.records if r["step"] == "llm_call"][0]
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["purpose"], "keyword_plan_r1")
+        self.assertEqual(rec["attempt"], 1)
+        self.assertGreater(rec["response_chars"], 0)
+        self.assertEqual(rec["request_chars"], len("sys") + len("user"))
+        self.assertEqual(client.stats()["llm_calls"], 1)
+
+    def test_fatal_error_is_not_retried(self) -> None:
+        """402 换参数重试没有意义，只该记一次。"""
+
+        class _Err(Exception):
+            status_code = 402
+
+        tracer = Tracer(None)
+        client = _stub_client(exc=_Err("Insufficient Balance"))
+        client.attach_tracer(tracer)
+        self.assertIsNone(client.chat_json("s", "u", purpose="event_build"))
+        calls = [r for r in tracer.records if r["step"] == "llm_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["ok"])
+        self.assertIn("402", calls[0]["error"])
+        self.assertIn("余额", calls[0]["error"])
+        # 失败时留下题面，否则无法复现"模型到底看到了什么"
+        self.assertIn("prompt_preview", calls[0])
+
+    def test_soft_error_retries_twice(self) -> None:
+        class _Err(Exception):
+            status_code = 500
+
+        tracer = Tracer(None)
+        client = _stub_client(exc=_Err("server error"))
+        client.attach_tracer(tracer)
+        self.assertIsNone(client.chat_json("s", "u", purpose="event_build"))
+        calls = [r for r in tracer.records if r["step"] == "llm_call"]
+        self.assertEqual([r["attempt"] for r in calls], [1, 2])
+        self.assertEqual(client.stats()["llm_failures"], 2)
+
+    def test_unparsable_then_fallback_succeeds(self) -> None:
+        tracer = Tracer(None)
+        client = _stub_client(["这不是 JSON", '{"events": []}'])
+        client.attach_tracer(tracer)
+        out = client.chat_json("s", "u", purpose="event_build")
+        self.assertEqual(out, {"events": []})
+        calls = [r for r in tracer.records if r["step"] == "llm_call"]
+        self.assertEqual([r["ok"] for r in calls], [False, True])
+        # 解析失败时要把模型原始输出留下来，否则不知道它到底返回了什么
+        self.assertIn("这不是 JSON", calls[0]["response_preview"])
+        stats = client.stats()
+        self.assertEqual((stats["llm_calls"], stats["llm_failures"]), (1, 1))
+
+    def test_no_tracer_still_counts(self) -> None:
+        """不给 tracer 也不能崩，统计照旧。"""
+        client = _stub_client(['{"a": 1}'])
+        self.assertEqual(client.chat_json("s", "u"), {"a": 1})
+        self.assertEqual(client.stats()["llm_calls"], 1)
+
+    def test_investigator_wires_tracer_into_llm(self) -> None:
+        """接线本身要锁住：Investigator 忘了 attach，trace 里就一条模型记录都没有。"""
+        client = _stub_client(['{"keywords": ["x"]}'])
+        inv = Investigator(session=None, llm=client, tracer=Tracer(None))
+        self.assertIs(client.tracer, inv.tracer)
+        client.chat_json("s", "u", purpose="keyword_plan_r1")
+        m = inv._metrics(Investigation(topic="t"))
+        self.assertEqual((m.llm_calls, m.llm_failures), (1, 0))
+
+    def test_markdown_shows_model_calls(self) -> None:
+        """报告里要能看出这次到底调了几次模型，否则只能靠猜。"""
+        inv = Investigation(topic="t", metrics=Metrics(llm_calls=3, llm_failures=1, llm_ms=2500))
+        md = inv.to_markdown()
+        self.assertIn("模型调用：成功 3 次｜失败尝试 1 次｜累计 2.5 秒", md)
 
 
 if __name__ == "__main__":

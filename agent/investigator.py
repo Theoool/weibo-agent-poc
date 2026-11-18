@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -89,6 +90,9 @@ class LLMClient:
     重要：调用失败时**不再静默返回 None**，而是把真实原因存进 last_error，
     由调用方写进 limitations。否则 402/401/404 都会显示成"输出不可解析"，
     把"账户没钱"误诊成"模型不会输出 JSON"。
+
+    每次尝试都会往 tracer 写一条 llm_call：模型输出一旦只留在日志里，
+    事后就只能靠猜"是模型判错，还是喂进去的数据本来就不够"。
     """
 
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
@@ -98,6 +102,11 @@ class LLMClient:
         self.available = bool(self.api_key)
         self.last_error: str = ""
         self._client = None
+        # 统计：calls/failures 都是**尝试**计数，一次调用可能尝试两次
+        self.calls = 0
+        self.failures = 0
+        self.total_ms = 0.0
+        self.tracer: Tracer | None = None
         if self.available:
             try:
                 from openai import OpenAI
@@ -107,23 +116,70 @@ class LLMClient:
                 self.available = False
                 self.last_error = f"客户端初始化失败：{exc}"
 
+    def attach_tracer(self, tracer: Tracer | None) -> None:
+        self.tracer = tracer
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "llm_calls": self.calls,
+            "llm_failures": self.failures,
+            "llm_ms": int(self.total_ms),
+        }
+
+    def _record(
+        self,
+        purpose: str,
+        attempt: int,
+        ok: bool,
+        started: float,
+        system: str,
+        user: str,
+        content: str,
+        error: str,
+    ) -> None:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        self.total_ms += duration_ms
+        if self.tracer is None:
+            return
+        rec: dict = {
+            "purpose": purpose or "unspecified",
+            "model": self.model,
+            "attempt": attempt,
+            "ok": ok,
+            "duration_ms": duration_ms,
+            "request_chars": len(system) + len(user),
+            "response_chars": len(content or ""),
+            # 存摘要而不是全文：能对上"这一轮用的是不是同一份输入"就够了
+            "prompt_digest": hashlib.sha1(f"{system}\n{user}".encode()).hexdigest()[:12],
+            "response_preview": (content or "")[:300],
+        }
+        if not ok:
+            rec["error"] = error
+            # 失败时把题面也留一份，否则无法复现"模型到底看到了什么"
+            rec["prompt_preview"] = user[:800]
+        self.tracer.log("llm_call", **rec)
+
     def ping(self) -> tuple[bool, str]:
         """最小连通性探针：只发一句 hello，用于 --doctor 与启动前自检。"""
         if not self.available or self._client is None:
             return False, self.last_error or "未配置 OPENAI_API_KEY"
+        started = time.perf_counter()
         try:
             resp = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": "只回复 ok"}],
                 max_tokens=5,
             )
-            return True, (resp.choices[0].message.content or "").strip()[:40]
+            detail = (resp.choices[0].message.content or "").strip()[:40]
+            self._record("ping", 1, True, started, "只回复 ok", "", detail, "")
+            return True, detail
         except Exception as exc:  # noqa: BLE001
             reason = _describe_api_error(exc)
             self.last_error = reason
+            self._record("ping", 1, False, started, "只回复 ok", "", "", reason)
             return False, reason
 
-    def chat_json(self, system: str, user: str) -> dict | None:
+    def chat_json(self, system: str, user: str, purpose: str = "") -> dict | None:
         if not self.available or self._client is None:
             self.last_error = self.last_error or "未配置 OPENAI_API_KEY"
             return None
@@ -132,7 +188,10 @@ class LLMClient:
             {"role": "user", "content": user},
         ]
         errors: list[str] = []
-        for kwargs in ({"response_format": {"type": "json_object"}}, {}):
+        for attempt, kwargs in enumerate(
+            ({"response_format": {"type": "json_object"}}, {}), 1
+        ):
+            started = time.perf_counter()
             try:
                 resp = self._client.chat.completions.create(
                     model=self.model, messages=messages, temperature=0.2, **kwargs
@@ -140,6 +199,8 @@ class LLMClient:
             except Exception as exc:  # noqa: BLE001
                 reason = _describe_api_error(exc)
                 errors.append(reason)
+                self.failures += 1
+                self._record(purpose, attempt, False, started, system, user, "", reason)
                 # 认证/余额/模型不存在这类错误，换参数重试没有意义
                 if _is_fatal_api_error(exc):
                     break
@@ -148,8 +209,13 @@ class LLMClient:
             payload = _loads_loose(content)
             if payload is not None:
                 self.last_error = ""
+                self.calls += 1
+                self._record(purpose, attempt, True, started, system, user, content, "")
                 return payload
-            errors.append(f"返回内容无法解析为 JSON（前 120 字：{content[:120]!r}）")
+            reason = f"返回内容无法解析为 JSON（前 120 字：{content[:120]!r}）"
+            errors.append(reason)
+            self.failures += 1
+            self._record(purpose, attempt, False, started, system, user, content, reason)
         self.last_error = "；".join(dict.fromkeys(errors))[:600]
         return None
 
@@ -231,6 +297,9 @@ class Investigator:
         self.tracer = tracer or Tracer(None)
         self.log = log
         self.llm_disabled = False
+        # 让每次模型调用都进同一条 trace，否则只能从 limitations 里看到"失败了"，
+        # 看不到失败在第几次尝试、消耗多少、模型实际返回了什么。
+        self.llm.attach_tracer(self.tracer)
 
         self.posts: dict[str, dict] = {}
         self.searches: list[SearchRecord] = []
@@ -278,7 +347,11 @@ class Investigator:
                     Limitation(step="模型调用", detail=f"连通性自检失败，全程降级 heuristic：{detail}")
                 )
 
-        self.log(f"[1/5] 读取公开热搜榜单（无需登录）……")
+        self.tracer.log(
+            "llm_mode", active=self._llm_active(), model=self.llm.model, error=self.llm.last_error
+        )
+
+        self.log("[1/5] 读取公开热搜榜单（无需登录）……")
         self.hot_items = read_hot_board(self.session)
         if not self.hot_items:
             self.limitations.append(
@@ -335,6 +408,7 @@ class Investigator:
             payload = self.llm.chat_json(
                 SYSTEM_PROMPT,
                 keyword_plan_prompt(self.topic, self.hot_items, keywords, 1),
+                purpose="keyword_plan_r1",
             )
             planned = (payload or {}).get("keywords") or []
             for kw in planned:
@@ -365,6 +439,7 @@ class Investigator:
                     self.topic, [f"#{c}#" for c in candidates] + self.hot_items,
                     list(searched), 2,
                 ),
+                purpose="keyword_plan_r2",
             )
             planned = [str(k).strip().strip("#") for k in (payload or {}).get("keywords") or []]
             planned = [k for k in planned if k and k not in searched]
@@ -458,6 +533,7 @@ class Investigator:
             payload = self.llm.chat_json(
                 SYSTEM_PROMPT,
                 event_build_prompt(self.topic, digest_posts(posts), len(posts), self.hot_items),
+                purpose="event_build",
             )
             events = self._events_from_llm(payload)
             if events:
@@ -745,6 +821,7 @@ class Investigator:
             events_formed=len(inv.events),
             evidence_items=sum(len(e.evidence) for e in inv.events),
             speculations=sum(len(e.speculations) for e in inv.events),
+            **self.llm.stats(),
         )
 
 

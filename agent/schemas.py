@@ -105,6 +105,10 @@ class Metrics(BaseModel):
     events_formed: int = 0
     evidence_items: int = 0
     speculations: int = 0
+    # 模型调用：calls 是成功次数，failures 是**尝试**失败次数（含重试前的失败）
+    llm_calls: int = 0
+    llm_failures: int = 0
+    llm_ms: int = 0
 
 
 class Investigation(BaseModel):
@@ -126,8 +130,13 @@ class Investigation(BaseModel):
                 f"- 关键词 {m.keywords_searched} 组｜读取帖子 {m.posts_read} 条｜"
                 f"详情页复核 {m.posts_detail_verified} 条｜事件 {m.events_formed} 个"
             ),
-            "",
         ]
+        if m.llm_calls or m.llm_failures:
+            lines.append(
+                f"- 模型调用：成功 {m.llm_calls} 次｜失败尝试 {m.llm_failures} 次"
+                f"｜累计 {m.llm_ms / 1000:.1f} 秒"
+            )
+        lines += [""]
 
         if self.limitations:
             lines += ["## 访问限制记录", ""]

@@ -39,3 +39,51 @@ class Tracer:
 
     def counts(self) -> dict[str, int]:
         return dict(Counter(r["step"] for r in self.records))
+
+
+def load(path: str | Path) -> list[dict[str, Any]]:
+    """读回 JSONL。
+
+    坏行直接跳过：trace 是用来排查问题的，不该因为最后一行被中断就整份读不出来。
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """把 trace 压成"这次跑得怎么样"。
+
+    重点是把模型调用单独拎出来：失败的可重试、可复现，才是能动手修的信息。
+    """
+    calls = [r for r in records if r.get("step") == "llm_call"]
+    return {
+        "total": len(records),
+        "counts": dict(Counter(r.get("step", "?") for r in records)),
+        "llm_calls": len(calls),
+        "llm_ok": sum(1 for r in calls if r.get("ok") is True),
+        "llm_failed": sum(1 for r in calls if r.get("ok") is False),
+        "llm_ms": sum(int(r.get("duration_ms") or 0) for r in calls),
+        "llm_purposes": dict(Counter(r.get("purpose", "?") for r in calls)),
+        "errors": [
+            {
+                "step": r.get("step"),
+                "purpose": r.get("purpose", ""),
+                "error": r.get("error", ""),
+            }
+            for r in records
+            if r.get("ok") is False or r.get("error")
+        ],
+    }
