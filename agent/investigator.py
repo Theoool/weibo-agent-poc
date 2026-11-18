@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections import Counter, defaultdict
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,7 +58,7 @@ from .schemas import (
     SearchRecord,
     dedupe_limitations,
 )
-from .trace import Tracer
+from .trace import LLMCall, TraceSink, Tracer
 
 _VALID_SOURCE_KINDS = {
     "weibo_post",
@@ -132,7 +133,7 @@ class LLMClient:
         self.calls = 0
         self.failures = 0
         self.total_ms = 0.0
-        self.tracer: Tracer | None = None
+        self.tracer: TraceSink | None = None
         if self.available:
             try:
                 from openai import OpenAI
@@ -142,7 +143,7 @@ class LLMClient:
                 self.available = False
                 self.last_error = f"客户端初始化失败：{exc}"
 
-    def attach_tracer(self, tracer: Tracer | None) -> None:
+    def attach_tracer(self, tracer: TraceSink | None) -> None:
         self.tracer = tracer
 
     def stats(self) -> dict[str, int]:
@@ -167,23 +168,27 @@ class LLMClient:
         self.total_ms += duration_ms
         if self.tracer is None:
             return
-        rec: dict = {
-            "purpose": purpose or "unspecified",
-            "model": self.model,
-            "attempt": attempt,
-            "ok": ok,
-            "duration_ms": duration_ms,
-            "request_chars": len(system) + len(user),
-            "response_chars": len(content or ""),
-            # 存摘要而不是全文：能对上"这一轮用的是不是同一份输入"就够了
-            "prompt_digest": hashlib.sha1(f"{system}\n{user}".encode()).hexdigest()[:12],
-            "response_preview": (content or "")[:300],
-        }
-        if not ok:
-            rec["error"] = error
-            # 失败时把题面也留一份，否则无法复现"模型到底看到了什么"
-            rec["prompt_preview"] = user[:800]
-        self.tracer.log("llm_call", **rec)
+        call = LLMCall(
+            purpose=purpose or "unspecified",
+            model=self.model,
+            base_url=self.base_url or "",
+            attempt=attempt,
+            ok=ok,
+            duration_ms=duration_ms,
+            system=system or "",
+            user=user or "",
+            content=content or "",
+            error=error or "",
+            prompt_digest=hashlib.sha1(f"{system}\n{user}".encode()).hexdigest()[:12],
+            created_at=datetime.now().isoformat(timespec="milliseconds"),
+        )
+        # 摘要进轨迹（人能一眼看懂的粒度）
+        self.tracer.log("llm_call", **call.to_record())
+        # 全文只给愿意接的 sink：数据库把 prompt / response 落内容寻址目录，
+        # 这样"模型当时看到了什么、答了什么"可以逐字复现，而不是靠 120 字预览去猜。
+        sink = getattr(self.tracer, "record_call", None)
+        if callable(sink):
+            sink(call)
 
     def ping(self) -> tuple[bool, str]:
         """最小连通性探针：只发一句 hello，用于 --doctor 与启动前自检。"""
@@ -308,7 +313,7 @@ class Investigator:
         max_events: int = 5,
         logged_in: bool = True,
         search_delay: float = 2.5,
-        tracer: Tracer | None = None,
+        tracer: TraceSink | None = None,
         log=print,
     ) -> None:
         self.session = session

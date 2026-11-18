@@ -24,6 +24,8 @@
 7) 查看工作流留存（不需要浏览器）
    uv run python main.py --runs
    uv run python main.py --show <run_id> --report
+   uv run python main.py --trace <run_id>          # 轨迹与模型调用
+   uv run python main.py --llm <call_id>           # 某次调用的题面与输出全文
 
 8) 把改造前的历史产物导入数据库（标记 degraded）
    uv run python main.py --import-output output
@@ -64,6 +66,24 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 def _clip(text: str, width: int) -> str:
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _topic_hint(path: str | Path) -> str:
+    """核查 run 的临时主题：优先读清单里的 title/topic，读不到退化为文件名。
+
+    报告标题要等核查跑完才有，跑完会用 `set_run_topic` 覆盖这里。
+    先占位是为了让这次运行从第一秒起就有个能认出来的名字。
+    """
+    p = Path(path)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        for key in ("title", "topic"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                return _clip(value, 80)
+    except Exception:  # noqa: BLE001
+        pass
+    return _clip(p.stem or "事实核查", 80)
 
 
 def _line(char: str = "-", n: int = 78) -> str:
@@ -269,7 +289,6 @@ def stage2(args: argparse.Namespace, session) -> int:
 
     from agent.controller import KIND_LABEL as GAP_LABEL
     from agent.investigator import Budget, Investigator, LLMClient, write_outputs
-    from agent.trace import Tracer
 
     print()
     print("[0/5] 检查登录态")
@@ -312,6 +331,9 @@ def stage2(args: argparse.Namespace, session) -> int:
         stage_id = store.begin_stage(run_id, "investigate")
         print(f"[DB] run {run_id}｜investigate 已开始")
 
+    # 轨迹双写：JSONL 给人看（可提交、可 diff），数据库留 SQL 可查的那一份
+    tracer, db_sink = build_tracer(trace_path, store, run_id, stage_id)
+
     investigator = Investigator(
         session=session,
         topic=args.keyword[0],
@@ -327,12 +349,14 @@ def stage2(args: argparse.Namespace, session) -> int:
         ),
         llm=client,
         logged_in=logged_in,
-        tracer=Tracer(trace_path),
+        tracer=tracer,
     )
     inv = investigator.run()
     if run_id:
         inv.run_id = run_id
     json_path, md_path = write_outputs(inv, OUTPUT_DIR)
+
+    report_tracer_errors(tracer)
 
     if store is not None and run_id:
         # posts 必须一起传：Investigation 里的证据正文是截断摘录，
@@ -348,6 +372,11 @@ def stage2(args: argparse.Namespace, session) -> int:
                 f"[DB] 已留存：文档 {stats['documents']}｜事件 {stats['events']}"
                 f"｜事实 {stats['facts']}｜缺口 {stats['gaps']}｜搜索 {stats['searches']}"
             )
+            if db_sink is not None:
+                print(
+                    f"[DB] 轨迹 {db_sink.seq} 条｜模型调用 {db_sink.calls} 次"
+                    f"（题面与输出全文已留存，可逐字复现）"
+                )
         except Exception as exc:  # noqa: BLE001
             store.end_stage(stage_id, "failed", str(exc))
             store.finish_run(run_id, "failed", error=str(exc))
@@ -421,19 +450,11 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
     from datetime import datetime
 
     from agent.investigator import LLMClient
-    from agent.trace import Tracer
     from factcheck.runner import run_factcheck
 
     print_header(None)
 
     client = LLMClient()
-    trace_path = None
-    if client.available and args.semantic is not False:
-        trace_path = OUTPUT_DIR / f"trace_factcheck_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
-        client.attach_tracer(Tracer(trace_path))
-        print(f"[模型] {client.model}（语义判定：引文是否支持说法）")
-    elif args.semantic is True:
-        print("[模型] 未配置 OPENAI_API_KEY，语义判定将跳过")
 
     store = open_persistence(args)
     source_run_id = ""
@@ -443,6 +464,41 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
         )
     except Exception:  # noqa: BLE001
         source_run_id = ""
+
+    # 先把 run 与 stage 建好，再跑核查：模型调用发生在核查过程中，
+    # 那时候必须已经有地方可写。反过来的话，语义判定的全文只能事后补，补不回来。
+    run_id = ""
+    stage_id = ""
+    created_run = False
+    if store is not None:
+        if source_run_id and store.run_summary(source_run_id):
+            run_id = source_run_id
+        else:
+            # 没有上游 run（例如手工维护的核查清单）：单独起一条，别硬塞进别人的 run
+            run_id = store.create_run(
+                _topic_hint(args.factcheck),
+                trigger="cli",
+                config={
+                    "claims_file": str(args.factcheck),
+                    "source_run_id": source_run_id,
+                    "semantic": bool(args.semantic) if args.semantic is not None else "auto",
+                    "checked": not args.no_check,
+                },
+            )
+            created_run = True
+        prev = store.latest_stage(run_id, "handoff")
+        stage_id = store.begin_stage(run_id, "factcheck", input_stage_id=prev)
+
+    trace_path = None
+    tracer = None
+    db_sink = None
+    if client.available and args.semantic is not False:
+        trace_path = OUTPUT_DIR / f"trace_factcheck_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        tracer, db_sink = build_tracer(trace_path, store, run_id, stage_id)
+        client.attach_tracer(tracer)
+        print(f"[模型] {client.model}（语义判定：引文是否支持说法）")
+    elif args.semantic is True:
+        print("[模型] 未配置 OPENAI_API_KEY，语义判定将跳过")
 
     report, json_path, md_path = run_factcheck(
         args.factcheck,
@@ -454,24 +510,10 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
         semantic_limit=args.semantic_limit,
     )
 
-    if store is not None:
-        run_id = source_run_id if (source_run_id and store.run_summary(source_run_id)) else ""
-        if not run_id:
-            # 没有上游 run（例如手工维护的核查清单）：单独起一条，别硬塞进别人的 run
-            run_id = store.create_run(
-                _clip(report.title or "事实核查", 80),
-                trigger="cli",
-                config={
-                    "claims_file": str(args.factcheck),
-                    "source_run_id": source_run_id,
-                    "semantic": bool(args.semantic) if args.semantic is not None else "auto",
-                    "checked": not args.no_check,
-                },
-            )
-            stage_id = store.begin_stage(run_id, "factcheck")
-        else:
-            prev = store.latest_stage(run_id, "handoff")
-            stage_id = store.begin_stage(run_id, "factcheck", input_stage_id=prev)
+    if tracer is not None:
+        report_tracer_errors(tracer)
+
+    if store is not None and run_id:
         try:
             stats = store.save_factcheck(
                 report,
@@ -480,6 +522,9 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
                 checked=not args.no_check,
                 artifacts={"factcheck_md": Path(md_path).read_text(encoding="utf-8")},
             )
+            if created_run:
+                # 标题要等报告生成后才有；不改的话 --runs 里会显示文件名
+                store.set_run_topic(run_id, _clip(report.title or "事实核查", 80))
             store.end_stage(stage_id, "succeeded")
             store.finish_run(run_id, "succeeded")
             print(
@@ -487,6 +532,11 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
                 f"｜说法 {stats['claims']}｜引用 {stats['citations']}"
                 f"（run {run_id}）"
             )
+            if db_sink is not None:
+                print(
+                    f"[DB] 轨迹 {db_sink.seq} 条｜模型调用 {db_sink.calls} 次"
+                    f"（题面与输出全文已留存，可逐字复现）"
+                )
         except Exception as exc:  # noqa: BLE001
             store.end_stage(stage_id, "failed", str(exc))
             store.finish_run(run_id, "failed", error=str(exc))
@@ -605,23 +655,47 @@ def run_handoff_stage(args: argparse.Namespace) -> int:
 def run_trace_stage(args: argparse.Namespace) -> int:
     from agent.trace import load, summarize
 
-    path = Path(args.trace)
     print_header(None)
-    if not path.exists():
-        print(f"找不到 trace 文件：{path}")
-        return 2
-    records = load(path)
+    path = Path(args.trace)
+    from_db = False
+    calls: list[dict] | None = None
+
+    if path.exists():
+        records = load(path)
+        label = path.name
+    else:
+        # 不当成路径时按 run_id 处理：M2 之后轨迹同时留在库里，
+        # "看这次运行到底发生了什么"不该依赖 output/ 下的某个文件还在不在
+        store = open_persistence(args)
+        if store is None:
+            print(f"找不到 trace 文件：{path}")
+            return 2
+        records = store.load_trace(args.trace)
+        if not records:
+            if store.run_summary(args.trace) is None:
+                print(f"{args.trace} 既不是存在的文件，也不是库里的 run_id。")
+                print("查看所有 run：uv run python main.py --runs")
+            else:
+                # 老 run 别让人以为"跑得很干净"，而是当时根本没往库里写
+                print(f"{args.trace} 是早于 M2 的 run：那次轨迹只写进了 output/trace_*.jsonl。")
+                print("新跑的运行会同时写库；旧运行请传 JSONL 路径查看。")
+            return 2
+        calls = store.load_llm_calls(args.trace)
+        label = args.trace
+        from_db = True
+
     if not records:
-        print(f"{path} 中没有可解析记录")
+        print(f"{label} 中没有可解析记录")
         return 2
 
     s = summarize(records)
-    print(f"[1/2] {path.name}：{s['total']} 条记录")
+    print(f"[1/2] {label}：{s['total']} 条记录" + ("（来自数据库）" if from_db else ""))
     print(_line())
     for step, n in sorted(s["counts"].items(), key=lambda kv: -kv[1]):
         print(f"  {step:<20}{n}")
 
-    calls = [r for r in records if r.get("step") == "llm_call"]
+    if calls is None:
+        calls = [r for r in records if r.get("step") == "llm_call"]
     print()
     print(
         f"[2/2] 模型调用 {len(calls)} 次（成功 {s['llm_ok']}｜失败 {s['llm_failed']}）"
@@ -644,6 +718,8 @@ def run_trace_stage(args: argparse.Namespace) -> int:
                 # 解析失败时 error 里已经带了返回内容，别重复打一遍
                 if preview and preview[:30] not in error:
                     print(f"      实际返回：{_clip(preview, 120)}")
+            if from_db and rec.get("id"):
+                print(f"      全文：uv run python main.py --llm {rec['id']}")
     else:
         print("  本次没有模型调用（heuristic 模式，或全部走了规则分支）")
 
@@ -654,14 +730,99 @@ def run_trace_stage(args: argparse.Namespace) -> int:
             print(f"  [{err['step']}] {err['purpose'] or '-'}：{_clip(err['error'], 160)}")
 
     print(_line("="))
-    print("读法：同一 purpose 的 prompt_digest 相同，说明输入完全一致；")
-    print("      此时输出不同才是模型随机性，输出相同但结论不同则是后处理的问题。")
+    if from_db:
+        print("读法：同一 purpose 的 prompt_digest 相同，说明输入完全一致；")
+        print("      此时输出不同才是模型随机性，输出相同但结论不同则是后处理的问题。")
+        print("      库里同时留了题面与输出全文，用 --llm <调用 id> 逐字看。")
+    else:
+        print("读法：同一 purpose 的 prompt_digest 相同，说明输入完全一致；")
+        print("      此时输出不同才是模型随机性，输出相同但结论不同则是后处理的问题。")
+        print("      文件里只有摘要；全文在库里（--trace <run_id> 可看到调用 id）。")
+    return 0
+
+
+def run_llm_stage(args: argparse.Namespace) -> int:
+    """打印一次模型调用的题面与输出全文。
+
+    M2 的核心验收点就在这条命令上：报告里的每个判断都能追回"模型当时
+    实际收到了什么、答了什么"，而不是只能看到一个 300 字预览。
+    """
+    print_header(None)
+    store = open_persistence(args)
+    if store is None:
+        return 2
+    call = store.load_llm_call(args.llm)
+    if call is None:
+        print(f"找不到模型调用记录：{args.llm}")
+        print("先跑一次带模型的阶段，再用 --trace <run_id> 拿到调用 id。")
+        return 2
+
+    mark = "成功" if call["ok"] else "失败"
+    print(f"{call['id']} ｜{call['purpose']}｜第 {call['attempt']} 次｜{mark}")
+    print(_line("="))
+    print(f"模型    ：{call['model']}（{call['base_url'] or '默认端点'}）")
+    print(f"时间    ：{call['created_at']}｜耗时 {call['duration_ms'] / 1000:.1f}s")
+    print(
+        f"长度    ：题面 {call['request_chars']} 字 → 输出 {call['response_chars']} 字"
+        f"｜digest {call['prompt_digest']}"
+    )
+    print(
+        "存储    ：题面 "
+        + ("外部文件（≥4KB）" if call["prompt_ref"] else "内联（<4KB）")
+        + "｜输出 "
+        + ("外部文件（≥4KB）" if call["response_ref"] else "内联（<4KB）")
+    )
+    if call["error"]:
+        print(f"错误    ：{call['error']}")
+
+    print()
+    print("题面全文")
+    print(_line())
+    print(call["prompt"] or "（未留存：这次调用在发出请求前就失败了）")
+    print()
+    print("模型输出全文")
+    print(_line())
+    print(call["response"] or "（空：模型没有返回内容）")
+    print(_line("="))
     return 0
 
 
 # --------------------------------------------------------------------------- #
 # 持久层：只在阶段边界出现，领域层不 import 它
 # --------------------------------------------------------------------------- #
+def build_tracer(trace_path: Path, store, run_id: str, stage_id: str):
+    """组一个同时写 JSONL 与数据库的轨迹 sink。
+
+    返回 (tracer, db_sink)。`db_sink` 为 None 说明本次只写文件（--no-db 或建 run 失败），
+    调用方据此决定要不要打印数据库侧的统计。
+
+    为什么用 fanout 而不是让 DbSink 直接继承 Tracer：两者职责不同——文件要轻、
+    数据库要全（含模型全文）。分开发事件，各写各的粒度。
+    """
+    from agent.trace import FanoutSink, Tracer
+
+    jsonl = Tracer(trace_path)
+    if store is None or not run_id:
+        return jsonl, None
+    from store.db_sink import DbSink
+
+    db_sink = DbSink(store, run_id, stage_id)
+    return FanoutSink(jsonl, db_sink), db_sink
+
+
+def report_tracer_errors(tracer) -> None:
+    """轨迹写库失败时明确告警。
+
+    不中断调查（文件产物还在），但必须说出来——否则事后会以为"这一段本来就没记录"。
+    """
+    errors = getattr(tracer, "errors", None) or []
+    if not errors:
+        return
+    print(f"[DB] 轨迹写入降级（{len(errors)} 类错误），文件轨迹不受影响：")
+    for err in errors:
+        print(f"      {_clip(err, 140)}")
+
+
 def open_persistence(args: argparse.Namespace):
     """打开数据库。失败时不中断主流程——文件产物仍然照写。
 
@@ -773,6 +934,11 @@ def run_show_stage(args: argparse.Namespace) -> int:
     print(_line())
     print(f"  证据文档 {c['documents']} 个｜事件 {c['events']} 个｜事实 {c['facts']} 条")
     print(f"  待核查说法 {c['claims']} 条｜模型调用 {c['llm_calls']} 次｜轨迹 {c['trace_events']} 条")
+    if c["llm_calls"] or c["trace_events"]:
+        print(f"  轨迹查看：uv run python main.py --trace {summary['id']}")
+    elif int(summary["metrics"].get("llm_calls") or 0) > 0:
+        # 指标说调过模型、表里却没有：这不是数据丢了，是那次运行早于轨迹入库
+        print("  注：该 run 早于 M2，模型调用只留在 JSONL 轨迹里，库里没有题面全文")
     metrics = summary["metrics"]
     if metrics:
         head = "｜".join(f"{k} {int(v)}" for k, v in sorted(metrics.items())[:8])
@@ -852,8 +1018,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trace",
         default=None,
-        metavar="TRACE_JSONL",
-        help="查看一次运行的轨迹（含每次模型调用），不需要浏览器",
+        metavar="TRACE_JSONL | RUN_ID",
+        help="查看一次运行的轨迹（含每次模型调用）：可传 JSONL 文件，也可直接传 run_id，不需要浏览器",
+    )
+    p.add_argument(
+        "--llm",
+        default=None,
+        metavar="CALL_ID",
+        help="打印一次模型调用的题面与输出全文（id 从 --trace 里取）",
     )
     p.add_argument(
         "--no-check",
@@ -929,6 +1101,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trace:
         return run_trace_stage(args)
+
+    if args.llm:
+        return run_llm_stage(args)
 
     if args.runs:
         return run_runs_stage(args)

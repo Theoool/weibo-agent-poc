@@ -1,11 +1,11 @@
 # 整体架构设计：工作流留存 + 数据分级 + FastAPI
 
-> 状态：设计已确认，M1 已实施（持久层 + 双写 + 历史导入），M2 起待做。
+> 状态：设计已确认，M1、M2 已实施（持久层 + 双写 + 历史导入；轨迹与模型调用全文入库）。
 > 范围：把当前「文件产物 + JSONL 轨迹」的 POC，改造成「以 run 为聚合根、证据可审计、API 可查询」的服务。
 >
 > 实施进度：
 > - [x] **M1** SQLAlchemy 模型、迁移（v1~v3）、`RunStore`、blobs、历史产物导入、CLI 双写
-> - [ ] **M2** `TraceSink` 协议 + `llm_call` / `trace_event` 落库
+> - [x] **M2** `TraceSink` 协议 + `DbSink` + `llm_call` / `trace_event` 落库（迁移 v4）
 > - [ ] **M3** FastAPI 只读层
 > - [ ] **M4** `POST /runs` + worker 队列
 > - [ ] **M5** 分级落地（备份、清理、索引）
@@ -14,6 +14,11 @@
 > M1 实施中修正了设计稿三处：`workflow_run` 增加 `report_at`（否则读回后报告时间漂移）、
 > `event_evidence` 增加 `seq`（否则证据顺序会乱，10 份历史产物里 8 份受影响）、
 > 迁移版本号改为由执行器记账（靠 SQL 文件自觉写 `schema_version` 会重复重放）。
+>
+> M2 又修正一处：设计稿 §3.5 只给了 `prompt_ref` / `response_ref`，但没有内联列。
+> 按 §2.4「< 4 KB 存 TEXT」的规则，ping 和短 JSON 的题面都不足 4 KB，指针为空、
+> 内容无处可放 —— 恰好丢掉最短也最常用的那批记录。迁移 v4 补 `prompt_inline` /
+> `response_inline`，语义与 `source_document.text_inline` 一致。
 
 ---
 
@@ -179,6 +184,16 @@ trace_event   id INTEGER PK AUTOINCREMENT, run_id, stage_run_id,
 
 `prompt_ref` / `response_ref` 是相对现有 `response_preview` 的关键升级：前者能复现，后者只能猜。
 
+实施（M2）时的三个取舍：
+
+- **JSONL 不存全文，数据库存。** 轨迹文件要能提交、能 diff，被几 MB 提示词撑爆就没人看了；
+  全文进 `llm_call`，按 §2.4 内联或走 CAS。两边记录的是同一件事，只是粒度不同。
+- **逐条提交，不攒批。** 轨迹要求「发生即写」：进程被杀时最想看的恰好是最后几步。
+  代价是一次运行多几十次小事务，SQLite WAL 下可以接受；攒批省下的那点时间，
+  换来的是「出事前最后 20 条永久丢失」。
+- **写库失败不中断调查。** `FanoutSink` 隔离异常并计数，收尾时明确告警。
+  静默吞掉比没有轨迹更糟：事后会以为这一段本来就没有记录。
+
 ### 3.6 度量（C 级）
 
 ```sql
@@ -302,6 +317,7 @@ weibo-agent-poc/
 │  ├─ models.py            # SQLAlchemy 2.0 模型
 │  ├─ repositories.py      # RunStore / DocumentStore
 │  ├─ blobs.py             # 内容寻址读写
+│  ├─ db_sink.py           # DbSink：轨迹与模型调用全文落库
 │  ├─ mappers.py           # Pydantic ↔ ORM
 │  └─ migrations/          # 顺序 SQL + schema_version
 ├─ agent/ browser/ factcheck/ tests/   # 基本不动
@@ -319,7 +335,7 @@ weibo-agent-poc/
 |---|---|---|
 | **M0** | 本文档 + 表设计评审 | 你确认分级与选型 |
 | **M1** | SQLAlchemy 模型 + 迁移 + `RunStore` + 历史产物导入 + 双写 | `--agent` 跑一次，DB 里能查到完整 run；旧产物能导入 |
-| **M2** | `TraceSink` 协议 + `DbSink` + `llm_call` 全文落库 | `--trace` 与 API 查到同一份数据；模型输出可复现 |
+| **M2** | `TraceSink` 协议 + `DbSink` + `llm_call` 全文落库 | `--trace <run_id>` 与文件轨迹查到同一份数据；`--llm <call_id>` 逐字复现题面与输出 |
 | **M3** | FastAPI 只读层 | 用历史数据回答：「哪次调查产出了这份核查」「某帖子被抓过几次、内容变没变」 |
 | **M4** | `POST /runs` + worker 队列 | 一条 curl 起一次调查，轮询到完成 |
 | **M5** | 分级落地：A 级备份脚本、C 级清理、索引 | 备份/恢复演练通过；清理 C 级后历史报告数字不变 |

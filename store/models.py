@@ -351,9 +351,11 @@ class LLMCall(Base):
     response_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # 全文，走内容寻址；空字符串表示这次没留下（例如调用前就失败了）
+    # 全文，走内容寻址；ref 为空表示不足 4KB、内容内联在下面的 *_inline 列里
     prompt_ref: Mapped[str] = mapped_column(String, nullable=False, default="")
     response_ref: Mapped[str] = mapped_column(String, nullable=False, default="")
+    prompt_inline: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_inline: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 

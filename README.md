@@ -3,7 +3,9 @@
 最小可跑版本：**Playwright 驱动的专用 Chrome → 手动登录一次微博 → 搜索 → 读取帖子 → 结构化落盘**，
 再在其上叠一个受约束的 Agent 调度层（关键词规划 / 扩展 / 事件归纳 / 证据复核）。
 
-第一版没有数据库，产物就是 `output/investigation.json` + `output/investigation.md`。
+产物有两条出口：`output/` 下的文件（导出视图，方便阅读与 diff）和 `data/workflow.db`（权威）。
+一次工作流是一个 `workflow_run`，证据全文、模型题面与输出、缺口决策都挂在它下面，
+用 `--runs` / `--show` / `--trace` / `--llm` 可以查回来。
 
 ---
 
@@ -20,7 +22,7 @@ cd weibo-agent-poc
 uv sync
 ```
 
-`uv sync` 会按 `pyproject.toml` 建 `.venv` 并装好 playwright / openai / pydantic / python-dotenv。
+`uv sync` 会按 `pyproject.toml` 建 `.venv` 并装好 playwright / openai / pydantic / sqlalchemy / python-dotenv。
 
 用的是本机 Chrome（`channel="chrome"`），**不需要**再下载 Chromium。只有在没有装 Chrome 时才需要：
 
@@ -109,8 +111,8 @@ Agent 会做：
 
 ```
 weibo-agent-poc/
-├─ main.py                  # CLI：--doctor / Day-1 / --agent / --trace / --handoff / --factcheck
-│                           #       --runs / --show / --import-output
+├─ main.py                  # CLI：--doctor / Day-1 / --agent / --trace / --llm / --handoff
+│                           #       --factcheck / --runs / --show / --import-output
 ├─ pyproject.toml
 ├─ .env                     # OPENAI_API_KEY / OPENAI_MODEL（留空即降级）
 ├─ docs/
@@ -119,6 +121,7 @@ weibo-agent-poc/
 │  ├─ models.py             # SQLAlchemy 2.0 映射（与 migrations 一一对应）
 │  ├─ migrations/           # 顺序 SQL + schema_version，不引 Alembic
 │  ├─ repositories.py       # RunStore：建 run、写阶段、落调查/核查产物、读回
+│  ├─ db_sink.py            # DbSink：轨迹行 + 模型题面/输出全文落库
 │  ├─ blobs.py              # 内容寻址存储，长正文走 artifacts/ 而不是 SQLite
 │  └─ importer.py           # 历史产物导入（标记 degraded）
 ├─ agent/
@@ -126,7 +129,7 @@ weibo-agent-poc/
 │  ├─ controller.py         # 缺口判定与补搜计划：什么时候再搜、搜什么、什么时候停
 │  ├─ merge.py              # 事件合并：同一事件的不同话题标签并成一个
 │  ├─ handoff.py            # 调查产物 → 核查待办（打通 POC 1 与 POC 2）
-│  ├─ trace.py              # 运行轨迹 JSONL，事后可回放每一步决策
+│  ├─ trace.py              # 轨迹协议 TraceSink + JSONL sink + 全文 sink 分发
 │  ├─ prompts.py            # 约束性提示词（禁止编造/猜链接）
 │  └─ schemas.py            # Pydantic 模型 + JSON→Markdown 渲染
 ├─ browser/
@@ -143,7 +146,8 @@ weibo-agent-poc/
 │  ├─ test_controller.py    # 缺口判定、候选白名单、补搜循环的停止条件
 │  ├─ test_factcheck.py     # 引文比对、降级规则、转载不独立、语义只降不升
 │  ├─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
-│  └─ test_store.py         # 持久层：schema 与模型一致、读回逐字一致、分级规则
+│  ├─ test_store.py         # 持久层：schema 与模型一致、读回逐字一致、分级规则
+│  └─ test_trace_db.py      # 轨迹入库：全文可复现、失败隔离、坏 sink 不拖垮调查
 ├─ data/                    # SQLite（gitignore）
 ├─ artifacts/               # 内容寻址的长文本（gitignore）
 └─ output/                  # 调查与核查产物（导出视图，gitignore）
@@ -192,8 +196,19 @@ uv run python main.py --factcheck output/claims_handoff.json     # 接着核查
 
 其中 `llm_call` 是**每一次模型尝试**（含重试）的留痕：`purpose / attempt / ok / duration_ms / request_chars / response_chars / prompt_digest / response_preview`，失败时额外附 `error` 和 `prompt_preview`（题面前 800 字）。这样"模型练坏了"和"喂进去的数据本来就不够"才能分开。
 
+轨迹有两条出口，粒度不同：
+
+| 出口 | 内容 | 用途 |
+|---|---|---|
+| `output/trace_*.jsonl` | 摘要（300 字预览） | 能提交、能 diff，看"哪一轮、多久、成没成" |
+| `trace_event` + `llm_call` 表 | 同一条记录 + 题面与输出**全文** | 逐字复现"模型当时看到了什么、答了什么"，长文本走 `artifacts/` |
+
+两个 sink 由一个 `FanoutSink` 分发。数据库写失败不会中断调查（文件产物还在），但会在收尾时明确打印降级原因——静默吞掉会让人误以为"这一段本来就没记录"。
+
 ```powershell
-uv run python main.py --trace output/trace_20261118_212101.jsonl
+uv run python main.py --trace output/trace_20261118_212101.jsonl   # 读文件
+uv run python main.py --trace run_20261118_232238_21138b          # 读库（同一个查看器）
+uv run python main.py --llm llm_20261118_232304_03a4bd            # 某次调用的题面与输出全文
 ```
 
 ```
@@ -268,7 +283,7 @@ trace 里对应新增 `gaps`、`round_plan`、`round_stop`、`gap_plan_rejected`
 uv run python -m unittest discover -s tests -t . -v
 ```
 
-覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单），以及证据引用的行号映射与证据计数——不依赖网络，共 91 例。
+覆盖 HTML 清洗、话题词抽取、container cards 递归解析、按 mid 去重合并、事件合并阈值、Fact 兼容、handoff 抽取、模型调用留痕（402 只记一次、软错误重试两次、解析失败后回退成功）、缺口判定与补搜循环的停止条件（无新数据即停、轮次上限、预算耗尽、候选白名单）、证据引用的行号映射与证据计数，以及持久层（schema 与模型逐列一致、存读后 `to_markdown()` 逐字一致、短文本内联／长文本走 CAS、坏 sink 不拖垮调查）——不依赖网络，共 129 例。
 
 ## 8. 边界：这个程序刻意不做什么
 
@@ -411,6 +426,8 @@ uv run python main.py --agent --keyword APEC           # 跑完自动落库，�
 uv run python main.py --runs                           # 看所有 run
 uv run python main.py --show <run_id>                  # 看某次留了什么（阶段、文档数、缺口、事件）
 uv run python main.py --show <run_id> --report         # 从数据库重新渲染报告
+uv run python main.py --trace <run_id>                 # 轨迹与每次模型调用（读库，不依赖文件还在）
+uv run python main.py --llm <call_id>                  # 某次调用的题面与输出全文
 uv run python main.py --import-output output           # 把改造前的历史产物补进库
 uv run python main.py --agent --keyword APEC --no-db   # 只写文件，不碰数据库
 ```
@@ -443,8 +460,23 @@ uv run python main.py --agent --keyword APEC --no-db   # 只写文件，不碰�
 
 改造前的 `output/*.json` 里，证据正文当年就被截断过，全文快照从来没存过。导入的 run 一律 `quality=degraded`，`--runs` 和 `--show` 都会显示这个标记，不假装和新数据等价。`day1_*.json` 会被跳过：它没法挂到某次调查上，硬导只会造出一批孤立的 run。
 
+### 模型调用可复现
+
+`llm_call` 存的是全文，不是 300 字预览：题面（system + user）与输出各自按「< 4KB 内联 / 否则内容寻址」落库，读回来与当时送出去的一致。一次真实核查的留痕：
+
+```
+run_20261118_232238_21138b
+[1/2] 1 条记录（来自数据库）
+  llm_call            1
+[2/2] 模型调用 1 次（成功 1｜失败 0）｜累计 26.0 秒
+   1. ok   claim_citation_check  26.0s  1379 → 333 字  digest addb5b081f06  第 1 次
+      全文：uv run python main.py --llm llm_20261118_232304_03a4bd
+```
+
+这条记录回答的正是以前答不了的问题：送到模型面前的是哪两条引文、它把 S1 判成 `partial` 的理由（"引文仅提及日期和地点，未包含具体场馆名称"）、以及这次判定花了 26 秒。摘要留在 JSONL 里负责"哪一轮、多久、成没成"，全文留在库里负责"到底看到了什么"。
+
 ### 与领域层的关系
 
-`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在两个边界：`main.py` 组装时调 `RunStore`，以及阶段结束时 `save_investigation` 一次性写入。所以原有的一百多个单测全部继续有效。
+`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在三个边界：`main.py` 组装时调 `RunStore` 建 run/阶段、`FanoutSink` 把轨迹与模型全文转给 `DbSink`、阶段结束时 `save_investigation` 一次性写入语义层。所以原有的一百多个单测全部继续有效（现为 129 例）。
 
 `tests/test_store.py` 里有一条最关键的用例：**保存后从库里读回，渲染出的 Markdown 必须与原始报告逐字一致**。少存任何一个字段这条就会失败——这是判断 schema 够不够用的硬标准。用 10 份真实历史产物验证过，全部逐字一致。

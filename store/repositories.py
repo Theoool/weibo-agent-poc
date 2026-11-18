@@ -719,6 +719,145 @@ class RunStore:
             return ""
         return self.blobs.get_text(row.content_ref)
 
+    # ---------------------------------------------------------------- 留痕
+    def save_trace_event(
+        self,
+        run_id: str,
+        stage_run_id: str | None,
+        *,
+        seq: int,
+        ts: str,
+        step: str,
+        payload: dict,
+    ) -> None:
+        """写一条轨迹。调用方负责递增 seq（同一个 sink 内计数，天然有序）。"""
+        with self.Session() as s:
+            s.add(
+                TraceEvent(
+                    run_id=run_id,
+                    stage_run_id=stage_run_id,
+                    seq=seq,
+                    ts=ts,
+                    step=step,
+                    # default=str：轨迹字段来自领域层的任意对象，遇到 datetime
+                    # 之类不该让整条记录写不进去
+                    payload_json=json.dumps(payload, ensure_ascii=False, default=str),
+                )
+            )
+            s.commit()
+
+    def save_llm_call(self, run_id: str, stage_run_id: str | None, call) -> str:
+        """一次模型调用落库：元数据进列，题面与输出走"小于 4KB 内联 / 否则 CAS"。
+
+        `call` 是 `agent.trace.LLMCall`（dataclass）。这里不 import 它的类型做校验：
+        仓储层只依赖字段名，测试里可以用一个同名属性的假对象替代。
+        """
+        prompt_text = call.request_text
+        prompt_ref, _, _ = self.blobs.put_text(prompt_text)
+        response_ref, _, _ = self.blobs.put_text(call.content or "")
+        call_id = new_id("llm")
+        with self.Session() as s:
+            s.add(
+                LLMCall(
+                    id=call_id,
+                    run_id=run_id,
+                    stage_run_id=stage_run_id,
+                    purpose=call.purpose,
+                    attempt=int(call.attempt or 1),
+                    ok=bool(call.ok),
+                    model=call.model or "",
+                    base_url=call.base_url or "",
+                    prompt_digest=call.prompt_digest or "",
+                    request_chars=int(call.request_chars),
+                    response_chars=len(call.content or ""),
+                    duration_ms=int(call.duration_ms or 0),
+                    error=call.error or "",
+                    prompt_ref=prompt_ref or "",
+                    response_ref=response_ref or "",
+                    prompt_inline=None if prompt_ref else prompt_text,
+                    response_inline=None if response_ref else (call.content or ""),
+                    created_at=call.created_at or now_iso(),
+                )
+            )
+            s.commit()
+        return call_id
+
+    def _llm_call_dict(self, row: LLMCall) -> dict:
+        def full_text(inline: str | None, ref: str) -> str:
+            if ref:
+                return self.blobs.get_text(ref)
+            return inline or ""
+
+        prompt = full_text(row.prompt_inline, row.prompt_ref)
+        response = full_text(row.response_inline, row.response_ref)
+        return {
+            "id": row.id,
+            "purpose": row.purpose,
+            "attempt": row.attempt,
+            "ok": bool(row.ok),
+            "model": row.model,
+            "base_url": row.base_url,
+            "prompt_digest": row.prompt_digest,
+            "request_chars": row.request_chars,
+            "response_chars": row.response_chars,
+            "duration_ms": row.duration_ms,
+            # 与 JSONL 轨迹同名，查看器可以直接复用同一套渲染
+            "response_preview": (response or "")[:300],
+            "error": row.error,
+            "created_at": row.created_at,
+            "prompt_ref": row.prompt_ref,
+            "response_ref": row.response_ref,
+            "prompt": prompt,
+            "response": response,
+        }
+
+    def load_llm_calls(self, run_id: str, limit: int = 200) -> list[dict]:
+        with self.Session() as s:
+            rows = list(
+                s.execute(
+                    select(LLMCall)
+                    .where(LLMCall.run_id == run_id)
+                    .order_by(LLMCall.created_at, LLMCall.id)
+                    .limit(limit)
+                ).scalars()
+            )
+            return [self._llm_call_dict(r) for r in rows]
+
+    def load_llm_call(self, call_id: str) -> dict | None:
+        with self.Session() as s:
+            row = s.get(LLMCall, call_id)
+            return self._llm_call_dict(row) if row is not None else None
+
+    def load_trace(self, run_id: str, limit: int = 5000, step: str | None = None) -> list[dict]:
+        """按 JSONL 的同一形状读回轨迹，让查看器只写一套渲染。
+
+        `step` 过滤在这里做而不是调用方做：轨迹条数会随轮次线性增长，
+        查"只看缺口判定"时没必要把几千条读进内存。
+        """
+        with self.Session() as s:
+            q = select(TraceEvent).where(TraceEvent.run_id == run_id)
+            if step:
+                q = q.where(TraceEvent.step == step)
+            rows = list(
+                s.execute(q.order_by(TraceEvent.seq, TraceEvent.id).limit(limit)).scalars()
+            )
+        return [{"ts": r.ts, "step": r.step, **_loads(r.payload_json, {})} for r in rows]
+
+    def set_run_topic(self, run_id: str, topic: str) -> None:
+        """核查阶段的 run 先按文件名建出来，报告标题要等跑完才知道。
+
+        不改的话，`--runs` 里会留下一堆 `claims_handoff` 这种文件名当主题。
+        """
+        topic = (topic or "").strip()
+        if not topic:
+            return
+        with self.Session() as s:
+            row = s.get(WorkflowRun, run_id)
+            if row is None:
+                return
+            row.topic = topic
+            s.commit()
+
     # ---------------------------------------------------------------- 读回
     def load_investigation(self, run_id: str) -> Investigation | None:
         """从库里重建 `Investigation`。
@@ -940,6 +1079,7 @@ class RunStore:
                 "started_at": run.started_at,
                 "finished_at": run.finished_at,
                 "error": run.error,
+                "partial": bool(run.partial),
                 "parent_run_id": run.parent_run_id,
                 "stages": stages,
                 "counts": counts,
