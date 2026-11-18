@@ -160,6 +160,9 @@ class Investigation(BaseModel):
     topic: str
     generated_at: datetime = Field(default_factory=datetime.now)
     mode: str = "heuristic"
+    # 产物自己带上 run_id，下游 handoff / factcheck 才能挂到同一条工作流上。
+    # 旧产物没有这个字段，空字符串表示"不知道属于哪次运行"。
+    run_id: str = ""
     events: list[Event] = Field(default_factory=list)
     searches: list[SearchRecord] = Field(default_factory=list)
     limitations: list[Limitation] = Field(default_factory=list)

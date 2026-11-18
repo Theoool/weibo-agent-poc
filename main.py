@@ -20,6 +20,15 @@
 
 6) 事实核查
    uv run python main.py --factcheck output/claims_handoff.json
+
+7) 查看工作流留存（不需要浏览器）
+   uv run python main.py --runs
+   uv run python main.py --show <run_id> --report
+
+8) 把改造前的历史产物导入数据库（标记 degraded）
+   uv run python main.py --import-output output
+
+默认会写数据库（data/workflow.db）；加 --no-db 可只产出文件。
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -58,6 +68,13 @@ def _clip(text: str, width: int) -> str:
 
 def _line(char: str = "-", n: int = 78) -> str:
     return char * n
+
+
+def _pad(text: str, width: int) -> str:
+    """按显示宽度补齐。中日韩字符占两格，直接用 ljust 会让整列错位。"""
+    text = _clip(text, width)
+    used = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+    return text + " " * max(0, width - used)
 
 
 def print_header(profile_dir: str | Path | None = None) -> None:
@@ -269,6 +286,32 @@ def stage2(args: argparse.Namespace, session) -> int:
 
     trace_path = OUTPUT_DIR / f"trace_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
 
+    # 先把 run 建出来：它的 id 要写进产物，下游 handoff / factcheck 才能挂到同一条链上
+    store = open_persistence(args)
+    run_id = ""
+    stage_id = ""
+    if store is not None:
+        run_id = store.create_run(
+            args.keyword[0],
+            trigger="cli",
+            mode="llm" if client.available else "heuristic",
+            config={
+                "keywords": args.keyword,
+                "rounds": args.rounds,
+                "max_searches": args.max_searches,
+                "max_pages": args.max_pages,
+                "max_minutes": args.max_minutes,
+                "max_posts": args.max_posts,
+                "min_evidence": args.min_evidence,
+                "detail_checks": args.detail_checks,
+                "model": client.model if client.available else "",
+                "base_url": (client.base_url or "") if client.available else "",
+                "logged_in": logged_in,
+            },
+        )
+        stage_id = store.begin_stage(run_id, "investigate")
+        print(f"[DB] run {run_id}｜investigate 已开始")
+
     investigator = Investigator(
         session=session,
         topic=args.keyword[0],
@@ -287,7 +330,28 @@ def stage2(args: argparse.Namespace, session) -> int:
         tracer=Tracer(trace_path),
     )
     inv = investigator.run()
+    if run_id:
+        inv.run_id = run_id
     json_path, md_path = write_outputs(inv, OUTPUT_DIR)
+
+    if store is not None and run_id:
+        # posts 必须一起传：Investigation 里的证据正文是截断摘录，
+        # 只靠它入库会把最该留住的全文快照永久丢掉
+        try:
+            stats = store.save_investigation(
+                inv, run_id, stage_id, posts=investigator.posts
+            )
+            store.save_artifact(run_id, stage_id, "report_md", inv.to_markdown())
+            store.end_stage(stage_id, "succeeded")
+            store.finish_run(run_id, "succeeded", stop_reason=inv.stop_reason)
+            print(
+                f"[DB] 已留存：文档 {stats['documents']}｜事件 {stats['events']}"
+                f"｜事实 {stats['facts']}｜缺口 {stats['gaps']}｜搜索 {stats['searches']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            store.end_stage(stage_id, "failed", str(exc))
+            store.finish_run(run_id, "failed", error=str(exc))
+            print(f"[DB] 写入失败：{exc}")
 
     print()
     print("决策链（缺口驱动）")
@@ -309,6 +373,9 @@ def stage2(args: argparse.Namespace, session) -> int:
     print(f"JSON：{json_path}")
     print(f"Markdown：{md_path}")
     print(f"运行轨迹：{trace_path}（{len(investigator.tracer.records)} 条事件）")
+    if run_id:
+        print(f"数据库  ：{run_id}")
+        print(f"          查看留存：uv run python main.py --show {run_id}")
     stats = investigator.llm.stats()
     if stats["llm_calls"] or stats["llm_failures"]:
         print(
@@ -368,6 +435,15 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
     elif args.semantic is True:
         print("[模型] 未配置 OPENAI_API_KEY，语义判定将跳过")
 
+    store = open_persistence(args)
+    source_run_id = ""
+    try:
+        source_run_id = str(
+            json.loads(Path(args.factcheck).read_text(encoding="utf-8")).get("source_run_id") or ""
+        )
+    except Exception:  # noqa: BLE001
+        source_run_id = ""
+
     report, json_path, md_path = run_factcheck(
         args.factcheck,
         OUTPUT_DIR,
@@ -377,6 +453,44 @@ def run_factcheck_stage(args: argparse.Namespace) -> int:
         semantic=args.semantic,
         semantic_limit=args.semantic_limit,
     )
+
+    if store is not None:
+        run_id = source_run_id if (source_run_id and store.run_summary(source_run_id)) else ""
+        if not run_id:
+            # 没有上游 run（例如手工维护的核查清单）：单独起一条，别硬塞进别人的 run
+            run_id = store.create_run(
+                _clip(report.title or "事实核查", 80),
+                trigger="cli",
+                config={
+                    "claims_file": str(args.factcheck),
+                    "source_run_id": source_run_id,
+                    "semantic": bool(args.semantic) if args.semantic is not None else "auto",
+                    "checked": not args.no_check,
+                },
+            )
+            stage_id = store.begin_stage(run_id, "factcheck")
+        else:
+            prev = store.latest_stage(run_id, "handoff")
+            stage_id = store.begin_stage(run_id, "factcheck", input_stage_id=prev)
+        try:
+            stats = store.save_factcheck(
+                report,
+                run_id,
+                stage_id,
+                checked=not args.no_check,
+                artifacts={"factcheck_md": Path(md_path).read_text(encoding="utf-8")},
+            )
+            store.end_stage(stage_id, "succeeded")
+            store.finish_run(run_id, "succeeded")
+            print(
+                f"[DB] 已留存：来源 {stats['sources']}｜机检 {stats['checks']}"
+                f"｜说法 {stats['claims']}｜引用 {stats['citations']}"
+                f"（run {run_id}）"
+            )
+        except Exception as exc:  # noqa: BLE001
+            store.end_stage(stage_id, "failed", str(exc))
+            store.finish_run(run_id, "failed", error=str(exc))
+            print(f"[DB] 写入失败：{exc}")
 
     s = report.summary
     print()
@@ -442,11 +556,29 @@ def run_handoff_stage(args: argparse.Namespace) -> int:
     print(f"[1/2] 读取调查产物：{src}")
     print(f"      主题「{inv.topic}」，{len(inv.events)} 个事件，模式 {inv.mode}")
 
+    store = open_persistence(args)
     payload = facts_to_claims(inv, only_events=args.events)
     h = payload["handoff"]
 
     out_path = OUTPUT_DIR / "claims_handoff.json"
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if store is not None:
+        run_id = inv.run_id
+        if run_id and store.run_summary(run_id) is None:
+            run_id = ""
+        if run_id:
+            prev = store.latest_stage(run_id, "investigate")
+            stage_id = store.begin_stage(run_id, "handoff", input_stage_id=prev)
+            store.save_artifact(
+                run_id, stage_id, "claims_json",
+                out_path.read_text(encoding="utf-8"),
+            )
+            store.end_stage(stage_id, "succeeded")
+            store.finish_run(run_id, "succeeded", stop_reason=inv.stop_reason)
+            print(f"      [DB] 已挂到 run {run_id}（handoff 阶段）")
+        else:
+            print("      [DB] 这份产物没带 run_id（旧产物或来自别处），未挂到工作流上")
 
     print("[2/2] 抽取待核查说法")
     print(_line())
@@ -528,6 +660,150 @@ def run_trace_stage(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# 持久层：只在阶段边界出现，领域层不 import 它
+# --------------------------------------------------------------------------- #
+def open_persistence(args: argparse.Namespace):
+    """打开数据库。失败时不中断主流程——文件产物仍然照写。
+
+    A 级原则要求"发生即写"，但让调查因为数据库不可用而整个失败更糟：
+    文件产物还在，事后可以补导。所以这里降级并**明确告警**，不静默。
+    """
+    if getattr(args, "no_db", False):
+        print("[DB] --no-db：本次只写文件产物")
+        return None
+    try:
+        from store import open_store
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DB] 持久层不可用（{exc}），本次只写文件产物")
+        return None
+    try:
+        store, applied = open_store(getattr(args, "db", None))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DB] 初始化失败（{exc}），本次只写文件产物")
+        return None
+    if applied:
+        print(f"[DB] 已应用迁移 v{', v'.join(str(v) for v in applied)}")
+    return store
+
+
+def run_import_stage(args: argparse.Namespace) -> int:
+    from store.importer import import_dir
+
+    print_header(None)
+    store = open_persistence(args)
+    if store is None:
+        return 2
+    src = Path(args.import_output)
+    if not src.exists():
+        print(f"找不到目录：{src}")
+        return 2
+
+    print(f"[1/2] 导入历史产物：{src}")
+    results = import_dir(store, src, log=print)
+    print(f"[2/2] 完成：导入 {len(results)} 个 run")
+    if results:
+        print(_line("="))
+        print("注意：导入的 run 标记为 quality=degraded —— 历史产物里没有帖子全文快照，")
+        print("      证据正文是当时截断后的摘录，不能当审计依据。")
+    return 0
+
+
+def run_runs_stage(args: argparse.Namespace) -> int:
+    print_header(None)
+    store = open_persistence(args)
+    if store is None:
+        return 2
+    rows = store.list_runs(limit=args.limit)
+    if not rows:
+        print("数据库里还没有 run。先跑一次 --agent，或用 --import-output 导入历史产物。")
+        return 0
+
+    print(f"工作流记录（最近 {len(rows)} 条）")
+    print(_line())
+    print(f"{_pad('run_id', 30)} {_pad('主题', 22)} {_pad('状态', 10)} {_pad('来源', 8)} {_pad('质量', 9)} 开始时间")
+    for row in rows:
+        print(
+            f"{_pad(row['id'], 30)} {_pad(row['topic'], 22)} {_pad(row['status'], 10)} "
+            f"{_pad(row['trigger'], 8)} {_pad(row['quality'], 9)} {row['started_at']}"
+        )
+    print(_line("="))
+    print("查看详情：uv run python main.py --show <run_id>")
+    return 0
+
+
+def run_show_stage(args: argparse.Namespace) -> int:
+    print_header(None)
+    store = open_persistence(args)
+    if store is None:
+        return 2
+    summary = store.run_summary(args.show)
+    if summary is None:
+        print(f"找不到 run：{args.show}")
+        return 2
+
+    print(f"{summary['id']}")
+    print(_line("="))
+    print(f"主题      ：{summary['topic']}")
+    print(f"状态      ：{summary['status']}"
+          + ("（部分完成）" if summary.get("partial") else ""))
+    print(f"触发方式  ：{summary['trigger']}")
+    print(f"数据质量  ：{summary['quality']}"
+          + ("（历史导入，无全文快照）" if summary["quality"] == "degraded" else ""))
+    print(f"运行模式  ：{summary['mode'] or '未记录'}")
+    print(f"时间      ：{summary['started_at']} → {summary['finished_at'] or '进行中'}")
+    if summary["stop_reason"]:
+        print(f"停止原因  ：{summary['stop_reason']}")
+    if summary["parent_run_id"]:
+        print(f"上游 run  ：{summary['parent_run_id']}")
+    if summary["error"]:
+        print(f"错误      ：{summary['error']}")
+
+    print()
+    print("阶段")
+    print(_line())
+    for st in summary["stages"]:
+        span = f"{st['started_at'][11:]}→{(st['finished_at'] or '')[:19][11:] or '进行中'}"
+        print(f"  {st['stage']:<12} 第 {st['attempt']} 次  {st['status']:<10} {span}")
+        if st["error"]:
+            print(f"      错误：{_clip(st['error'], 70)}")
+
+    c = summary["counts"]
+    print()
+    print("留存内容")
+    print(_line())
+    print(f"  证据文档 {c['documents']} 个｜事件 {c['events']} 个｜事实 {c['facts']} 条")
+    print(f"  待核查说法 {c['claims']} 条｜模型调用 {c['llm_calls']} 次｜轨迹 {c['trace_events']} 条")
+    metrics = summary["metrics"]
+    if metrics:
+        head = "｜".join(f"{k} {int(v)}" for k, v in sorted(metrics.items())[:8])
+        print(f"  指标：{head}")
+
+    inv = store.load_investigation(args.show)
+    if inv is not None and inv.events:
+        print()
+        print("事件（从数据库读回）")
+        print(_line())
+        for i, ev in enumerate(inv.events, 1):
+            print(
+                f"  {i}. {_clip(ev.name, 30)}｜证据 {len(ev.evidence)} 条"
+                f"｜事实 {len(ev.facts)} 条｜热度 {ev.heat}"
+            )
+
+    if args.report:
+        if inv is None:
+            print()
+            print("没有可渲染的调查产物（该 run 可能只跑了核查阶段）。")
+        else:
+            print()
+            print(_line("="))
+            print(inv.to_markdown())
+
+    print(_line("="))
+    print("说明：报告是现渲染的，数据来自数据库，不是读 output/ 下的文件。")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -605,6 +881,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="语义判定最多处理多少条说法",
     )
     p.add_argument(
+        "--db",
+        default=None,
+        metavar="PATH",
+        help="SQLite 路径（默认 data/workflow.db）",
+    )
+    p.add_argument(
+        "--no-db",
+        action="store_true",
+        help="本次不写数据库，只产出文件",
+    )
+    p.add_argument(
+        "--import-output",
+        default=None,
+        metavar="DIR",
+        help="把目录下的历史产物导入数据库（标记为 degraded）",
+    )
+    p.add_argument("--runs", action="store_true", help="列出工作流记录")
+    p.add_argument("--show", default=None, metavar="RUN_ID", help="查看一条工作流的留存内容")
+    p.add_argument(
+        "--report",
+        action="store_true",
+        help="配合 --show：从数据库重新渲染报告",
+    )
+    p.add_argument("--limit", type=int, default=20, help="配合 --runs：最多列出多少条")
+    p.add_argument(
         "--handoff",
         default=None,
         help="把调查产物转成核查待办：传 investigation.json 路径",
@@ -628,6 +929,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trace:
         return run_trace_stage(args)
+
+    if args.runs:
+        return run_runs_stage(args)
+
+    if args.show:
+        return run_show_stage(args)
+
+    if args.import_output:
+        return run_import_stage(args)
 
     if args.handoff:
         picked = None

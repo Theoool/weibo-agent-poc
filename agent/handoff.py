@@ -130,6 +130,8 @@ def facts_to_claims(
 
     return {
         "title": f"{inv.topic} 事实核查（由调查产物自动生成）",
+        # 带上来源 run，核查阶段才能挂到同一条工作流上，而不是另起一条孤立的记录
+        "source_run_id": inv.run_id,
         "original_report": (
             f"{inv.topic}，生成于 {inv.generated_at:%Y-%m-%d %H:%M}，"
             f"运行模式 {inv.mode}"

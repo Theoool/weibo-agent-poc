@@ -110,8 +110,17 @@ Agent 会做：
 ```
 weibo-agent-poc/
 ├─ main.py                  # CLI：--doctor / Day-1 / --agent / --trace / --handoff / --factcheck
+│                           #       --runs / --show / --import-output
 ├─ pyproject.toml
 ├─ .env                     # OPENAI_API_KEY / OPENAI_MODEL（留空即降级）
+├─ docs/
+│  └─ architecture.md       # 数据分级、表设计、API 规划（改造前先写的设计稿）
+├─ store/                   # 持久层：领域对象与数据库之间唯一的转换点
+│  ├─ models.py             # SQLAlchemy 2.0 映射（与 migrations 一一对应）
+│  ├─ migrations/           # 顺序 SQL + schema_version，不引 Alembic
+│  ├─ repositories.py       # RunStore：建 run、写阶段、落调查/核查产物、读回
+│  ├─ blobs.py              # 内容寻址存储，长正文走 artifacts/ 而不是 SQLite
+│  └─ importer.py           # 历史产物导入（标记 degraded）
 ├─ agent/
 │  ├─ investigator.py       # 调度层：预算、去重、事件归纳、证据复核、落盘
 │  ├─ controller.py         # 缺口判定与补搜计划：什么时候再搜、搜什么、什么时候停
@@ -133,8 +142,11 @@ weibo-agent-poc/
 │  ├─ test_parsers.py       # 抓取层纯函数单测（不联网）
 │  ├─ test_controller.py    # 缺口判定、候选白名单、补搜循环的停止条件
 │  ├─ test_factcheck.py     # 引文比对、降级规则、转载不独立、语义只降不升
-│  └─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
-└─ output/                  # 调查与核查产物
+│  ├─ test_workflow.py      # 事件合并、Fact 兼容、handoff、trace、模型调用留痕
+│  └─ test_store.py         # 持久层：schema 与模型一致、读回逐字一致、分级规则
+├─ data/                    # SQLite（gitignore）
+├─ artifacts/               # 内容寻址的长文本（gitignore）
+└─ output/                  # 调查与核查产物（导出视图，gitignore）
 ```
 
 ## 6. 工作流：从"管道"到"有留痕的链路"
@@ -387,3 +399,52 @@ uv run python main.py --factcheck output/claims_handoff.json --semantic-limit 5
 ### 一个刻意的设计
 
 “无法证实”不等于“假的”。程序只回答“能否用可打开的原始来源支撑这句话”，不替读者推断真伪。同样，“未发现反向证据”也不等于“不存在反向证据”，报告里对这两点都有固定提示语。
+
+## 13. 数据留存：run 是聚合根
+
+改造前有个说不清的问题：四阶段靠**固定文件名**串接（`investigation.json` → `claims_handoff.json` → `claims_handoff_factcheck.json`），第二次运行会覆盖第一次，而带时间戳的副本只保留了 investigation。于是“这份核查报告核的是哪一次调查”根本答不上来。
+
+现在每次运行是一个 `workflow_run`，四个阶段是它的 `stage_run`，靠外键串链。设计稿见 [`docs/architecture.md`](docs/architecture.md)。
+
+```powershell
+uv run python main.py --agent --keyword APEC           # 跑完自动落库，输出里带 run_id
+uv run python main.py --runs                           # 看所有 run
+uv run python main.py --show <run_id>                  # 看某次留了什么（阶段、文档数、缺口、事件）
+uv run python main.py --show <run_id> --report         # 从数据库重新渲染报告
+uv run python main.py --import-output output           # 把改造前的历史产物补进库
+uv run python main.py --agent --keyword APEC --no-db   # 只写文件，不碰数据库
+```
+
+### 数据分三级，判据只有一条
+
+> **只靠 A 级数据 + 当前代码，能不能重新算出这份报告？** 能 → B/C 级；不能 → A 级。
+
+| 级别 | 内容 | 机制 |
+|---|---|---|
+| **A 不可再生** | 帖子全文快照、提示词与模型原始输出、机检结果、降级原因、缺口决策 | append-only，正文与结论不 UPDATE，永不自动清理 |
+| **B 可重算但贵** | event / fact / 报告渲染产物 / 搜索记录 | 阶段结束一次事务写入，可整体重写 |
+| **C 可丢弃** | `run_metric`、候选词池、页面 HTML、trace 统计 | 随时可重算，可设 TTL 清理 |
+
+落在这些表上：`workflow_run` / `stage_run` / `source_document` / `document_fetch` / `event` / `event_evidence` / `fact` / `fact_support` / `gap_record` / `limitation` / `search_record` / `claim_check` / `factcheck_source` / `source_check` / `citation` / `llm_call` / `trace_event` / `run_metric`。
+
+### 三个容易划错的地方
+
+- **报告里引的是摘录，库里存的是全文。** `Evidence.content` 是被截断过的（摘要取 160 字、handoff 取 60 字）。所以入库时要把 `Investigator.posts` 一起传进去，只存 `Investigation` 会把最该留住的正文永久丢掉。`source_document.text_inline` 存全文，`event_evidence.content_excerpt` 存当时引用的那段。
+- **trace 的记录是 A 级，trace 的统计是 C 级。** 耗时汇总可以重算，“第 3 轮判了 2 个缺口”不能重算。
+- **跳过机检时不写 `source_check`。** 否则会留下一批“不可达”的假记录，和真的校验失败无法区分。`--no-check` 时传 `checked=False`。
+
+### 内容寻址：同一条帖子只存一份
+
+正文 < 4KB 直接进 `text_inline`，否则写 `artifacts/<sha256[:2]>/<sha256>`，库里只存 `text_ref`。同一 URL 被抓 10 次只占一份；内容变了会产生第二条 `source_document`（hash 不同），于是“这条帖子改过没有”变得可回答。
+
+备份要同时覆盖 `data/` 和 `artifacts/`——只备份 `.db` 会得到一堆指向空文件的引用。
+
+### 历史产物导入标 degraded
+
+改造前的 `output/*.json` 里，证据正文当年就被截断过，全文快照从来没存过。导入的 run 一律 `quality=degraded`，`--runs` 和 `--show` 都会显示这个标记，不假装和新数据等价。`day1_*.json` 会被跳过：它没法挂到某次调查上，硬导只会造出一批孤立的 run。
+
+### 与领域层的关系
+
+`Investigator`、`Controller`、`factcheck/runner.py` 几乎没改，仍然只认 Pydantic 模型和 `TraceSink`。数据库只出现在两个边界：`main.py` 组装时调 `RunStore`，以及阶段结束时 `save_investigation` 一次性写入。所以原有的一百多个单测全部继续有效。
+
+`tests/test_store.py` 里有一条最关键的用例：**保存后从库里读回，渲染出的 Markdown 必须与原始报告逐字一致**。少存任何一个字段这条就会失败——这是判断 schema 够不够用的硬标准。用 10 份真实历史产物验证过，全部逐字一致。

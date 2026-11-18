@@ -8,6 +8,7 @@ dependencies = [
     "openai>=1.60.0",
     "python-dotenv>=1.0.1",
     "pydantic>=2.7.0",
+    "sqlalchemy>=2.0",
 ]
 
 [tool.uv]
